@@ -4,18 +4,7 @@ use core::hint::black_box;
 
 use jolt::{end_cycle_tracking, start_cycle_tracking};
 
-use blake2 as blake2_reference;
-use blake3 as blake3_reference;
 use jolt_inlines_blake2 as blake2_inline;
-use jolt_inlines_blake3 as blake3_inline;
-use jolt_inlines_keccak256 as keccak_inline;
-use jolt_inlines_sha2 as sha2_inline;
-use sha2::{self as sha2_reference, Digest};
-use sha3 as keccak_reference;
-
-const INPUT_SIZE_64: usize = 64;
-const INPUT_SIZE_256: usize = 256;
-const INPUT_SIZE_2048: usize = 2048;
 
 #[jolt::provable(
     max_output_size = 4096,
@@ -25,22 +14,24 @@ const INPUT_SIZE_2048: usize = 2048;
 )]
 fn hashbench() -> [u8; 32] {
     // 64 bytes
-    benchmark_blake2_reference_64();
-    benchmark_blake2_inline_64();
+    benchmark_64();
+    benchmark_64_unaligned();
 
     // 256 bytes
-    benchmark_blake2_reference_256();
-    benchmark_blake2_inline_256();
+    benchmark_256();
+    benchmark_256_unaligned();
+
+    // 1024 bytes
+    benchmark_1024();
+    benchmark_1024_unaligned();
 
     // 2048 bytes
-    benchmark_blake2_reference_2048();
-    benchmark_blake2_inline_2048();
+    benchmark_2048();
+    benchmark_2048_unaligned();
 
     return [0; 32];
 }
 
-/// Assigns deterministic random-looking values to array
-/// Uses a simple Linear Congruential Generator (LCG) algorithm to fill the array
 fn assign_random_looking_values(array: &mut [u8], seed: u32) {
     const A: u32 = 1664525;
     const C: u32 = 1013904223;
@@ -52,116 +43,151 @@ fn assign_random_looking_values(array: &mut [u8], seed: u32) {
     }
 }
 
-#[allow(dead_code)]
-fn benchmark_sha2_reference() {
-    let mut input = [5u8; INPUT_SIZE_2048];
-    assign_random_looking_values(&mut input, 40);
-    start_cycle_tracking("sha2_reference");
-    let result = black_box(sha2_reference::Sha256::digest(black_box(&input)));
-    black_box(result);
-    end_cycle_tracking("sha2_reference");
-}
+// ==================== 64 bytes ====================
 
-#[allow(dead_code)]
-fn benchmark_sha2_inline() {
-    let mut input = [5u8; INPUT_SIZE_2048];
-    assign_random_looking_values(&mut input, 40);
-    start_cycle_tracking("sha2_inline");
-    let result = black_box(sha2_inline::Sha256::digest(black_box(&input)));
-    black_box(result);
-    end_cycle_tracking("sha2_inline");
-}
-
-#[allow(dead_code)]
-fn benchmark_keccak_reference() {
-    let mut input = [5u8; INPUT_SIZE_2048];
-    assign_random_looking_values(&mut input, 30);
-    start_cycle_tracking("keccak_reference");
-    let result = black_box(keccak_reference::Keccak256::digest(black_box(&input)));
-    black_box(result);
-    end_cycle_tracking("keccak_reference");
-}
-
-#[allow(dead_code)]
-fn benchmark_keccak_inline() {
-    let mut input = [5u8; INPUT_SIZE_2048];
-    assign_random_looking_values(&mut input, 30);
-    start_cycle_tracking("keccak_inline");
-    let result = black_box(keccak_inline::Keccak256::digest(black_box(&input)));
-    black_box(result);
-    end_cycle_tracking("keccak_inline");
-}
-
-fn benchmark_blake2_reference_64() {
-    let mut input = [5u8; INPUT_SIZE_64];
+fn benchmark_64() {
+    let mut input = [5u8; 64];
     assign_random_looking_values(&mut input, 20);
-    start_cycle_tracking("blake2_reference_64");
-    let result = black_box(blake2_reference::Blake2b512::digest(black_box(&input)));
-    black_box(result);
-    end_cycle_tracking("blake2_reference_64");
+
+    let left: &[u8; 32] = input[..32].try_into().unwrap();
+    let right: &[u8; 32] = input[32..].try_into().unwrap();
+
+    start_cycle_tracking("digest_64");
+    let r1 = black_box(blake2_inline::Blake2b::digest(black_box(&input[..])));
+    end_cycle_tracking("digest_64");
+
+    start_cycle_tracking("no_copy_64");
+    let r2 = black_box(blake2_inline::Blake2b::digest_no_copy(black_box(&input[..])));
+    end_cycle_tracking("no_copy_64");
+
+    start_cycle_tracking("d64_64");
+    let r3 = black_box(blake2_inline::Blake2b::digest_64(black_box(&input[..])));
+    end_cycle_tracking("d64_64");
+
+    start_cycle_tracking("split_64");
+    let r4 = black_box(blake2_inline::Blake2b::digest_64_split(black_box(left), black_box(right)));
+    end_cycle_tracking("split_64");
+
+    assert_eq!(r1, r2);
+    assert_eq!(r2, r3);
+    assert_eq!(r3, r4);
 }
 
-fn benchmark_blake2_reference_256() {
-    let mut input = [5u8; INPUT_SIZE_256];
+fn benchmark_64_unaligned() {
+    let mut buffer = [5u8; 65];
+    assign_random_looking_values(&mut buffer, 20);
+    let input = &buffer[1..];
+
+    start_cycle_tracking("digest_64_un");
+    let r1 = black_box(blake2_inline::Blake2b::digest(black_box(input)));
+    end_cycle_tracking("digest_64_un");
+
+    start_cycle_tracking("no_copy_64_un");
+    let r2 = black_box(blake2_inline::Blake2b::digest_no_copy(black_box(input)));
+    end_cycle_tracking("no_copy_64_un");
+
+    start_cycle_tracking("d64_64_un");
+    let _ = black_box(blake2_inline::Blake2b::digest_64(black_box(input)));
+    end_cycle_tracking("d64_64_un");
+
+    assert_eq!(r1, r2);
+}
+
+// ==================== 256 bytes ====================
+
+fn benchmark_256() {
+    let mut input = [5u8; 256];
     assign_random_looking_values(&mut input, 20);
-    start_cycle_tracking("blake2_reference_256");
-    let result = black_box(blake2_reference::Blake2b512::digest(black_box(&input)));
-    black_box(result);
-    end_cycle_tracking("blake2_reference_256");
+
+    start_cycle_tracking("digest_256");
+    let r1 = black_box(blake2_inline::Blake2b::digest(black_box(&input[..])));
+    end_cycle_tracking("digest_256");
+
+    start_cycle_tracking("no_copy_256");
+    let r2 = black_box(blake2_inline::Blake2b::digest_no_copy(black_box(&input[..])));
+    end_cycle_tracking("no_copy_256");
+
+    assert_eq!(r1, r2);
 }
 
-fn benchmark_blake2_reference_2048() {
-    let mut input = [5u8; INPUT_SIZE_2048];
+fn benchmark_256_unaligned() {
+    let mut buffer = [5u8; 257];
+    assign_random_looking_values(&mut buffer, 20);
+    let input = &buffer[1..];
+
+    start_cycle_tracking("digest_256_un");
+    let r1 = black_box(blake2_inline::Blake2b::digest(black_box(input)));
+    end_cycle_tracking("digest_256_un");
+
+    start_cycle_tracking("no_copy_256_un");
+    let r2 = black_box(blake2_inline::Blake2b::digest_no_copy(black_box(input)));
+    end_cycle_tracking("no_copy_256_un");
+
+    assert_eq!(r1, r2);
+}
+
+// ==================== 1024 bytes ====================
+
+fn benchmark_1024() {
+    let mut input = [5u8; 1024];
     assign_random_looking_values(&mut input, 20);
-    start_cycle_tracking("blake2_reference_2048");
-    let result = black_box(blake2_reference::Blake2b512::digest(black_box(&input)));
-    black_box(result);
-    end_cycle_tracking("blake2_reference_2048");
+
+    start_cycle_tracking("digest_1024");
+    let r1 = black_box(blake2_inline::Blake2b::digest(black_box(&input[..])));
+    end_cycle_tracking("digest_1024");
+
+    start_cycle_tracking("no_copy_1024");
+    let r2 = black_box(blake2_inline::Blake2b::digest_no_copy(black_box(&input[..])));
+    end_cycle_tracking("no_copy_1024");
+
+    assert_eq!(r1, r2);
 }
 
-fn benchmark_blake2_inline_64() {
-    let mut input = [5u8; INPUT_SIZE_64];
+fn benchmark_1024_unaligned() {
+    let mut buffer = [5u8; 1025];
+    assign_random_looking_values(&mut buffer, 20);
+    let input = &buffer[1..];
+
+    start_cycle_tracking("digest_1024_un");
+    let r1 = black_box(blake2_inline::Blake2b::digest(black_box(input)));
+    end_cycle_tracking("digest_1024_un");
+
+    start_cycle_tracking("no_copy_1024_un");
+    let r2 = black_box(blake2_inline::Blake2b::digest_no_copy(black_box(input)));
+    end_cycle_tracking("no_copy_1024_un");
+
+    assert_eq!(r1, r2);
+}
+
+// ==================== 2048 bytes ====================
+
+fn benchmark_2048() {
+    let mut input = [5u8; 2048];
     assign_random_looking_values(&mut input, 20);
-    start_cycle_tracking("blake2_inline_64");
-    let result = black_box(blake2_inline::Blake2b::digest(black_box(&input)));
-    black_box(result);
-    end_cycle_tracking("blake2_inline_64");
+
+    start_cycle_tracking("digest_2048");
+    let r1 = black_box(blake2_inline::Blake2b::digest(black_box(&input[..])));
+    end_cycle_tracking("digest_2048");
+
+    start_cycle_tracking("no_copy_2048");
+    let r2 = black_box(blake2_inline::Blake2b::digest_no_copy(black_box(&input[..])));
+    end_cycle_tracking("no_copy_2048");
+
+    assert_eq!(r1, r2);
 }
 
-fn benchmark_blake2_inline_256() {
-    let mut input = [5u8; INPUT_SIZE_256];
-    assign_random_looking_values(&mut input, 20);
-    start_cycle_tracking("blake2_inline_256");
-    let result = black_box(blake2_inline::Blake2b::digest(black_box(&input)));
-    black_box(result);
-    end_cycle_tracking("blake2_inline_256");
-}
+fn benchmark_2048_unaligned() {
+    let mut buffer = [5u8; 2049];
+    assign_random_looking_values(&mut buffer, 20);
+    let input = &buffer[1..];
 
-fn benchmark_blake2_inline_2048() {
-    let mut input = [5u8; INPUT_SIZE_2048];
-    assign_random_looking_values(&mut input, 20);
-    start_cycle_tracking("blake2_inline_2048");
-    let result = black_box(blake2_inline::Blake2b::digest(black_box(&input)));
-    black_box(result);
-    end_cycle_tracking("blake2_inline_2048");
-}
+    start_cycle_tracking("digest_2048_un");
+    let r1 = black_box(blake2_inline::Blake2b::digest(black_box(input)));
+    end_cycle_tracking("digest_2048_un");
 
-#[allow(dead_code)]
-fn benchmark_blake3_reference() {
-    let mut input = [5u8; INPUT_SIZE_64];
-    assign_random_looking_values(&mut input, 10);
-    start_cycle_tracking("blake3_reference");
-    let result = black_box(blake3_reference::hash(black_box(&input)));
-    black_box(result);
-    end_cycle_tracking("blake3_reference");
-}
+    start_cycle_tracking("no_copy_2048_un");
+    let r2 = black_box(blake2_inline::Blake2b::digest_no_copy(black_box(input)));
+    end_cycle_tracking("no_copy_2048_un");
 
-#[allow(dead_code)]
-fn benchmark_blake3_inline() {
-    let mut input = [5u8; INPUT_SIZE_64];
-    assign_random_looking_values(&mut input, 10);
-    start_cycle_tracking("blake3_inline");
-    let result: [u8; 32] = black_box(blake3_inline::Blake3::digest(black_box(&input)));
-    black_box(result);
-    end_cycle_tracking("blake3_inline");
+    assert_eq!(r1, r2);
 }
