@@ -23,14 +23,14 @@ const BLAKE3_INPUT_SIZE: usize = 64;
     max_trace_length = 20553600
 )]
 fn hashbench() -> [u8; 32] {
-    benchmark_sha2_reference();
-    benchmark_sha2_inline();
-    benchmark_keccak_reference();
-    benchmark_keccak_inline();
+    // benchmark_sha2_reference();
+    // benchmark_sha2_inline();
+    // benchmark_keccak_reference();
+    // benchmark_keccak_inline();
     benchmark_blake2_reference();
     benchmark_blake2_inline();
-    benchmark_blake3_reference();
-    benchmark_blake3_inline();
+    // benchmark_blake3_reference();
+    // benchmark_blake3_inline();
 
     return [0; 32];
 }
