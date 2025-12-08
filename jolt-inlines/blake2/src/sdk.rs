@@ -129,6 +129,7 @@ impl Blake2b {
     }
 
     /// Computes BLAKE2b hash in one call.
+    /// Optimized for virtual cycles by avoiding intermediate buffers for small inputs.
     #[inline(always)]
     pub fn digest(input: &[u8]) -> [u8; OUTPUT_SIZE] {
         let mut h = IV;
@@ -136,20 +137,15 @@ impl Blake2b {
 
         let len = input.len();
 
-        // Empty input
+        // Empty input: direct compression
         if len == 0 {
-            let block = [0u8; BLOCK_INPUT_SIZE_IN_BYTES];
-            compress(&mut h, &block, 0, true);
+            compress_direct(&mut h, &[], 0, true);
             return to_bytes(h);
         }
 
-        // Single block (≤128 bytes): copy to aligned buffer
+        // Single block (≤128 bytes): direct compression (no intermediate buffer)
         if len <= BLOCK_INPUT_SIZE_IN_BYTES {
-            let mut block = [0u8; BLOCK_INPUT_SIZE_IN_BYTES];
-            unsafe {
-                core::ptr::copy_nonoverlapping(input.as_ptr(), block.as_mut_ptr(), len);
-            }
-            compress(&mut h, &block, len as u64, true);
+            compress_direct(&mut h, input, len as u64, true);
             return to_bytes(h);
         }
 
@@ -181,16 +177,9 @@ impl Blake2b {
             let block = &input[offset..offset + BLOCK_INPUT_SIZE_IN_BYTES];
             compress(&mut h, block, len as u64, true);
         } else {
-            // Partial final block needs padding
-            let mut tail = [0u8; BLOCK_INPUT_SIZE_IN_BYTES];
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    input.as_ptr().add(full_blocks * BLOCK_INPUT_SIZE_IN_BYTES),
-                    tail.as_mut_ptr(),
-                    tail_len,
-                );
-            }
-            compress(&mut h, &tail, len as u64, true);
+            // Partial final block: use direct compression
+            let tail_offset = full_blocks * BLOCK_INPUT_SIZE_IN_BYTES;
+            compress_direct(&mut h, &input[tail_offset..], len as u64, true);
         }
 
         to_bytes(h)
@@ -297,6 +286,78 @@ fn compress(hash_state: &mut [u64; STATE_VECTOR_LEN], block: &[u8], counter: u64
 
     unsafe {
         blake2b_compress(hash_state.as_mut_ptr(), message.as_ptr());
+    }
+}
+
+/// Compress with direct copy to message array (no intermediate buffer).
+/// Optimized for virtual cycles by avoiding double-copy for small inputs.
+#[inline(always)]
+fn compress_direct(
+    hash_state: &mut [u64; STATE_VECTOR_LEN],
+    input: &[u8],
+    counter: u64,
+    is_final: bool,
+) {
+    // Use MaybeUninit to avoid zeroing the full array
+    let mut message: core::mem::MaybeUninit<[u64; MSG_BLOCK_LEN + 2]> =
+        core::mem::MaybeUninit::uninit();
+    let len = input.len();
+    let message_ptr = message.as_mut_ptr() as *mut u8;
+
+    #[cfg(target_endian = "little")]
+    unsafe {
+        // Copy input directly to message
+        if len > 0 {
+            core::ptr::copy_nonoverlapping(input.as_ptr(), message_ptr, len);
+        }
+        // Zero only the padding bytes (from input end to block end)
+        if len < BLOCK_INPUT_SIZE_IN_BYTES {
+            core::ptr::write_bytes(message_ptr.add(len), 0, BLOCK_INPUT_SIZE_IN_BYTES - len);
+        }
+    }
+
+    #[cfg(target_endian = "big")]
+    {
+        let message_ref = unsafe { &mut *message.as_mut_ptr() };
+        // Zero the message block first for big-endian
+        for i in 0..MSG_BLOCK_LEN {
+            message_ref[i] = 0;
+        }
+
+        // For big-endian, handle partial bytes carefully
+        let full_words = len / 8;
+        let remaining = len % 8;
+
+        for i in 0..full_words {
+            let offset = i * 8;
+            message_ref[i] = u64::from_le_bytes([
+                input[offset],
+                input[offset + 1],
+                input[offset + 2],
+                input[offset + 3],
+                input[offset + 4],
+                input[offset + 5],
+                input[offset + 6],
+                input[offset + 7],
+            ]);
+        }
+
+        if remaining > 0 {
+            let mut bytes = [0u8; 8];
+            let offset = full_words * 8;
+            for j in 0..remaining {
+                bytes[j] = input[offset + j];
+            }
+            message_ref[full_words] = u64::from_le_bytes(bytes);
+        }
+    }
+
+    // Set counter and is_final, then compress
+    unsafe {
+        let message_ref = &mut *message.as_mut_ptr();
+        message_ref[MSG_BLOCK_LEN] = counter;
+        message_ref[MSG_BLOCK_LEN + 1] = is_final as u64;
+        blake2b_compress(hash_state.as_mut_ptr(), message_ref.as_ptr());
     }
 }
 

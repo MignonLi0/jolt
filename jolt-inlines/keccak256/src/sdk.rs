@@ -133,6 +133,7 @@ impl Keccak256 {
     }
 
     /// Computes Keccak-256 hash in one call.
+    /// Optimized for virtual cycles by avoiding intermediate buffer for final block.
     #[inline(always)]
     pub fn digest(input: &[u8]) -> [u8; HASH_LEN] {
         let len = input.len();
@@ -147,22 +148,9 @@ impl Keccak256 {
             offset += RATE_IN_BYTES;
         }
 
-        // Final block with Keccak padding (0x01 at start, 0x80 at end)
+        // Final block with Keccak padding - use direct absorb
         let remaining = len - offset;
-        let mut final_block = [0u8; RATE_IN_BYTES];
-        if remaining > 0 {
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    input.as_ptr().add(offset),
-                    final_block.as_mut_ptr(),
-                    remaining,
-                );
-            }
-        }
-        final_block[remaining] = 0x01;
-        final_block[RATE_IN_BYTES - 1] |= 0x80;
-
-        absorb(&mut state, &final_block);
+        absorb_final(&mut state, &input[offset..], remaining);
         to_bytes(state)
     }
 
@@ -248,6 +236,54 @@ fn absorb(state: &mut [u64; 25], block: &[u8]) {
                 core::ptr::copy_nonoverlapping(ptr.add(i * 8), tmp.as_mut_ptr() as *mut u8, 8);
                 u64::from_le_bytes(tmp.assume_init())
             };
+            state[i] ^= word;
+        }
+    }
+
+    unsafe {
+        keccak_f(state.as_mut_ptr());
+    }
+}
+
+/// Absorb final block with padding directly into state.
+#[inline(always)]
+fn absorb_final(state: &mut [u64; 25], input: &[u8], len: usize) {
+    // Build padded block and XOR into state
+    let mut block = [0u8; RATE_IN_BYTES];
+
+    if len > 0 {
+        unsafe {
+            core::ptr::copy_nonoverlapping(input.as_ptr(), block.as_mut_ptr(), len);
+        }
+    }
+
+    // Keccak padding: 0x01 at end of data, 0x80 at end of block
+    block[len] = 0x01;
+    block[RATE_IN_BYTES - 1] |= 0x80;
+
+    // XOR padded block into state
+    #[cfg(target_endian = "little")]
+    unsafe {
+        let block_words = block.as_ptr() as *const u64;
+        for i in 0..RATE_IN_U64 {
+            state[i] ^= *block_words.add(i);
+        }
+    }
+
+    #[cfg(target_endian = "big")]
+    {
+        for i in 0..RATE_IN_U64 {
+            let offset = i * 8;
+            let word = u64::from_le_bytes([
+                block[offset],
+                block[offset + 1],
+                block[offset + 2],
+                block[offset + 3],
+                block[offset + 4],
+                block[offset + 5],
+                block[offset + 6],
+                block[offset + 7],
+            ]);
             state[i] ^= word;
         }
     }

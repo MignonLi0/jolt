@@ -107,6 +107,7 @@ impl Blake3 {
     }
 
     /// Computes BLAKE3 hash in one call (max 64 bytes input).
+    /// Optimized for virtual cycles by avoiding intermediate buffer.
     #[inline(always)]
     pub fn digest(input: &[u8]) -> [u8; OUTPUT_SIZE_IN_BYTES] {
         let len = input.len();
@@ -115,16 +116,9 @@ impl Blake3 {
         }
 
         let mut h = IV;
-        let mut block = [0u8; BLOCK_INPUT_SIZE_IN_BYTES];
-        if len > 0 {
-            unsafe {
-                core::ptr::copy_nonoverlapping(input.as_ptr(), block.as_mut_ptr(), len);
-            }
-        }
-
-        compress(
+        compress_direct(
             &mut h,
-            &block,
+            input,
             0,
             len as u32,
             FLAG_CHUNK_START | FLAG_CHUNK_END | FLAG_ROOT,
@@ -133,6 +127,7 @@ impl Blake3 {
     }
 
     /// Computes a keyed BLAKE3 hash (max 64 bytes input).
+    /// Optimized for virtual cycles by avoiding intermediate buffer.
     #[inline(always)]
     pub fn keyed_hash(input: &[u8], key: [u32; CHAINING_VALUE_LEN]) -> [u8; OUTPUT_SIZE_IN_BYTES] {
         let len = input.len();
@@ -141,16 +136,9 @@ impl Blake3 {
         }
 
         let mut h = key;
-        let mut block = [0u8; BLOCK_INPUT_SIZE_IN_BYTES];
-        if len > 0 {
-            unsafe {
-                core::ptr::copy_nonoverlapping(input.as_ptr(), block.as_mut_ptr(), len);
-            }
-        }
-
-        compress(
+        compress_direct(
             &mut h,
-            &block,
+            input,
             0,
             len as u32,
             FLAG_CHUNK_START | FLAG_CHUNK_END | FLAG_ROOT | FLAG_KEYED_HASH,
@@ -258,6 +246,62 @@ fn compress(
                 block[offset + 2],
                 block[offset + 3],
             ]);
+        }
+    }
+
+    message[MSG_BLOCK_LEN] = counter as u32;
+    message[MSG_BLOCK_LEN + 1] = (counter >> 32) as u32;
+    message[MSG_BLOCK_LEN + COUNTER_LEN] = input_bytes_num;
+    message[MSG_BLOCK_LEN + COUNTER_LEN + 1] = flags;
+
+    unsafe {
+        blake3_compress(hash_state.as_mut_ptr(), message.as_ptr());
+    }
+}
+
+/// Compress with direct copy to message array (no intermediate buffer).
+/// Optimized for virtual cycles by avoiding double-copy.
+#[inline(always)]
+fn compress_direct(
+    hash_state: &mut [u32; CHAINING_VALUE_LEN],
+    input: &[u8],
+    counter: u64,
+    input_bytes_num: u32,
+    flags: u32,
+) {
+    let mut message = [0u32; MSG_BLOCK_LEN + COUNTER_LEN + 2];
+    let len = input.len();
+
+    #[cfg(target_endian = "little")]
+    if len > 0 {
+        unsafe {
+            // Copy input directly to message (padded with zeros)
+            core::ptr::copy_nonoverlapping(input.as_ptr(), message.as_mut_ptr() as *mut u8, len);
+        }
+    }
+
+    #[cfg(target_endian = "big")]
+    {
+        let full_words = len / 4;
+        let remaining = len % 4;
+
+        for i in 0..full_words {
+            let offset = i * 4;
+            message[i] = u32::from_le_bytes([
+                input[offset],
+                input[offset + 1],
+                input[offset + 2],
+                input[offset + 3],
+            ]);
+        }
+
+        if remaining > 0 {
+            let mut bytes = [0u8; 4];
+            let offset = full_words * 4;
+            for j in 0..remaining {
+                bytes[j] = input[offset + j];
+            }
+            message[full_words] = u32::from_le_bytes(bytes);
         }
     }
 
