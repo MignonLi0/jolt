@@ -145,6 +145,44 @@ impl Blake3 {
         );
         to_bytes(h)
     }
+
+    /// Computes a keyed BLAKE3 hash for exactly 64 bytes input.
+    /// Uses specialized instruction that embeds counter/flags as constants.
+    #[inline(always)]
+    pub fn keyed_hash64(
+        input: &[u8; BLOCK_INPUT_SIZE_IN_BYTES],
+        key: [u32; CHAINING_VALUE_LEN],
+    ) -> [u8; OUTPUT_SIZE_IN_BYTES] {
+        let mut h = key;
+
+        // Use input directly as message pointer (requires 4-byte alignment)
+        // This avoids the copy entirely on little-endian systems
+        #[cfg(target_endian = "little")]
+        {
+            unsafe {
+                blake3_keyed64_compress(h.as_mut_ptr(), input.as_ptr() as *const u32);
+            }
+        }
+
+        #[cfg(target_endian = "big")]
+        {
+            let mut message = [0u32; MSG_BLOCK_LEN];
+            for i in 0..MSG_BLOCK_LEN {
+                let offset = i * 4;
+                message[i] = u32::from_le_bytes([
+                    input[offset],
+                    input[offset + 1],
+                    input[offset + 2],
+                    input[offset + 3],
+                ]);
+            }
+            unsafe {
+                blake3_keyed64_compress(h.as_mut_ptr(), message.as_ptr());
+            }
+        }
+
+        to_bytes(h)
+    }
 }
 
 #[inline(always)]
