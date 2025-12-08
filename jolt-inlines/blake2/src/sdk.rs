@@ -124,24 +124,24 @@ impl Blake2b {
 
         let len = input.len();
 
-        // Empty input: single padded block
+        // Empty input
         if len == 0 {
             let block = [0u8; BLOCK_INPUT_SIZE_IN_BYTES];
             compress(&mut h, &block, 0, true);
             return to_bytes(h);
         }
 
-        // Small input (≤128 bytes): single block, use unaligned-safe path
+        // Single block (≤128 bytes): copy to aligned buffer
         if len <= BLOCK_INPUT_SIZE_IN_BYTES {
             let mut block = [0u8; BLOCK_INPUT_SIZE_IN_BYTES];
             unsafe {
                 core::ptr::copy_nonoverlapping(input.as_ptr(), block.as_mut_ptr(), len);
             }
-            compress_unaligned(&mut h, &block, len as u64, true);
+            compress(&mut h, &block, len as u64, true);
             return to_bytes(h);
         }
 
-        // Large input: process full blocks, then final block
+        // Large input: process full blocks directly, then final block
         let full_blocks = len / BLOCK_INPUT_SIZE_IN_BYTES;
         let tail_len = len % BLOCK_INPUT_SIZE_IN_BYTES;
         let non_final_blocks = if tail_len == 0 {
@@ -150,6 +150,7 @@ impl Blake2b {
             full_blocks
         };
 
+        // Process non-final blocks directly (no copy)
         for i in 0..non_final_blocks {
             let offset = i * BLOCK_INPUT_SIZE_IN_BYTES;
             let block = &input[offset..offset + BLOCK_INPUT_SIZE_IN_BYTES];
@@ -163,14 +164,12 @@ impl Blake2b {
 
         // Final block
         if tail_len == 0 {
+            // Last full block is final
             let offset = (full_blocks - 1) * BLOCK_INPUT_SIZE_IN_BYTES;
-            compress(
-                &mut h,
-                &input[offset..offset + BLOCK_INPUT_SIZE_IN_BYTES],
-                len as u64,
-                true,
-            );
+            let block = &input[offset..offset + BLOCK_INPUT_SIZE_IN_BYTES];
+            compress(&mut h, block, len as u64, true);
         } else {
+            // Partial final block needs padding
             let mut tail = [0u8; BLOCK_INPUT_SIZE_IN_BYTES];
             unsafe {
                 core::ptr::copy_nonoverlapping(
@@ -237,39 +236,6 @@ fn compress(hash_state: &mut [u64; STATE_VECTOR_LEN], block: &[u8], counter: u64
             message.as_mut_ptr() as *mut u8,
             BLOCK_INPUT_SIZE_IN_BYTES,
         );
-    }
-
-    message[MSG_BLOCK_LEN] = counter;
-    message[MSG_BLOCK_LEN + 1] = is_final as u64;
-
-    unsafe {
-        blake2b_compress(hash_state.as_mut_ptr(), message.as_ptr());
-    }
-}
-
-/// Compress a 128-byte block with unaligned-safe reads.
-#[inline(always)]
-fn compress_unaligned(
-    hash_state: &mut [u64; STATE_VECTOR_LEN],
-    block: &[u8],
-    counter: u64,
-    is_final: bool,
-) {
-    let mut message = [0u64; MSG_BLOCK_LEN + 2];
-
-    // Load 16 u64 words using explicit 8-byte copies
-    for i in 0..MSG_BLOCK_LEN {
-        let base = i * 8;
-        let word = unsafe {
-            let mut tmp = core::mem::MaybeUninit::<[u8; 8]>::uninit();
-            core::ptr::copy_nonoverlapping(
-                block.as_ptr().add(base),
-                tmp.as_mut_ptr() as *mut u8,
-                8,
-            );
-            u64::from_le_bytes(tmp.assume_init())
-        };
-        message[i] = word;
     }
 
     message[MSG_BLOCK_LEN] = counter;
