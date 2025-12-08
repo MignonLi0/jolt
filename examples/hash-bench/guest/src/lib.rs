@@ -5,6 +5,7 @@ use core::hint::black_box;
 use jolt::{end_cycle_tracking, start_cycle_tracking};
 
 use jolt_inlines_blake2 as blake2_inline;
+use jolt_inlines_blake3 as blake3_inline;
 
 #[jolt::provable(
     max_output_size = 4096,
@@ -13,21 +14,16 @@ use jolt_inlines_blake2 as blake2_inline;
     max_trace_length = 20553600
 )]
 fn hashbench() -> [u8; 32] {
-    // 64 bytes
-    benchmark_64();
-    benchmark_64_unaligned();
+    // Blake2b
+    benchmark_blake2_64();
+    benchmark_blake2_64_unaligned();
+    benchmark_blake2_256();
+    benchmark_blake2_256_unaligned();
 
-    // 256 bytes
-    benchmark_256();
-    benchmark_256_unaligned();
-
-    // 1024 bytes
-    benchmark_1024();
-    benchmark_1024_unaligned();
-
-    // 2048 bytes
-    benchmark_2048();
-    benchmark_2048_unaligned();
+    // Blake3
+    benchmark_blake3_64();
+    benchmark_blake3_64_unaligned();
+    benchmark_blake3_32();
 
     return [0; 32];
 }
@@ -43,151 +39,130 @@ fn assign_random_looking_values(array: &mut [u8], seed: u32) {
     }
 }
 
-// ==================== 64 bytes ====================
+// ==================== Blake2b ====================
 
-fn benchmark_64() {
+fn benchmark_blake2_64() {
     let mut input = [5u8; 64];
     assign_random_looking_values(&mut input, 20);
 
     let left: &[u8; 32] = input[..32].try_into().unwrap();
     let right: &[u8; 32] = input[32..].try_into().unwrap();
 
-    start_cycle_tracking("digest_64");
+    start_cycle_tracking("b2_digest_64");
     let r1 = black_box(blake2_inline::Blake2b::digest(black_box(&input[..])));
-    end_cycle_tracking("digest_64");
+    end_cycle_tracking("b2_digest_64");
 
-    start_cycle_tracking("no_copy_64");
+    start_cycle_tracking("b2_no_copy_64");
     let r2 = black_box(blake2_inline::Blake2b::digest_no_copy(black_box(&input[..])));
-    end_cycle_tracking("no_copy_64");
+    end_cycle_tracking("b2_no_copy_64");
 
-    start_cycle_tracking("d64_64");
-    let r3 = black_box(blake2_inline::Blake2b::digest_64(black_box(&input[..])));
-    end_cycle_tracking("d64_64");
-
-    start_cycle_tracking("split_64");
-    let r4 = black_box(blake2_inline::Blake2b::digest_64_split(black_box(left), black_box(right)));
-    end_cycle_tracking("split_64");
+    start_cycle_tracking("b2_split_64");
+    let r3 = black_box(blake2_inline::Blake2b::digest_64_split(black_box(left), black_box(right)));
+    end_cycle_tracking("b2_split_64");
 
     assert_eq!(r1, r2);
     assert_eq!(r2, r3);
-    assert_eq!(r3, r4);
 }
 
-fn benchmark_64_unaligned() {
+fn benchmark_blake2_64_unaligned() {
     let mut buffer = [5u8; 65];
     assign_random_looking_values(&mut buffer, 20);
     let input = &buffer[1..];
 
-    start_cycle_tracking("digest_64_un");
+    start_cycle_tracking("b2_digest_64_un");
     let r1 = black_box(blake2_inline::Blake2b::digest(black_box(input)));
-    end_cycle_tracking("digest_64_un");
+    end_cycle_tracking("b2_digest_64_un");
 
-    start_cycle_tracking("no_copy_64_un");
+    start_cycle_tracking("b2_no_copy_64_un");
     let r2 = black_box(blake2_inline::Blake2b::digest_no_copy(black_box(input)));
-    end_cycle_tracking("no_copy_64_un");
-
-    start_cycle_tracking("d64_64_un");
-    let _ = black_box(blake2_inline::Blake2b::digest_64(black_box(input)));
-    end_cycle_tracking("d64_64_un");
+    end_cycle_tracking("b2_no_copy_64_un");
 
     assert_eq!(r1, r2);
 }
 
-// ==================== 256 bytes ====================
-
-fn benchmark_256() {
+fn benchmark_blake2_256() {
     let mut input = [5u8; 256];
     assign_random_looking_values(&mut input, 20);
 
-    start_cycle_tracking("digest_256");
+    start_cycle_tracking("b2_digest_256");
     let r1 = black_box(blake2_inline::Blake2b::digest(black_box(&input[..])));
-    end_cycle_tracking("digest_256");
+    end_cycle_tracking("b2_digest_256");
 
-    start_cycle_tracking("no_copy_256");
+    start_cycle_tracking("b2_no_copy_256");
     let r2 = black_box(blake2_inline::Blake2b::digest_no_copy(black_box(&input[..])));
-    end_cycle_tracking("no_copy_256");
+    end_cycle_tracking("b2_no_copy_256");
 
     assert_eq!(r1, r2);
 }
 
-fn benchmark_256_unaligned() {
+fn benchmark_blake2_256_unaligned() {
     let mut buffer = [5u8; 257];
     assign_random_looking_values(&mut buffer, 20);
     let input = &buffer[1..];
 
-    start_cycle_tracking("digest_256_un");
+    start_cycle_tracking("b2_digest_256_un");
     let r1 = black_box(blake2_inline::Blake2b::digest(black_box(input)));
-    end_cycle_tracking("digest_256_un");
+    end_cycle_tracking("b2_digest_256_un");
 
-    start_cycle_tracking("no_copy_256_un");
+    start_cycle_tracking("b2_no_copy_256_un");
     let r2 = black_box(blake2_inline::Blake2b::digest_no_copy(black_box(input)));
-    end_cycle_tracking("no_copy_256_un");
+    end_cycle_tracking("b2_no_copy_256_un");
 
     assert_eq!(r1, r2);
 }
 
-// ==================== 1024 bytes ====================
+// ==================== Blake3 ====================
 
-fn benchmark_1024() {
-    let mut input = [5u8; 1024];
-    assign_random_looking_values(&mut input, 20);
+fn benchmark_blake3_64() {
+    let mut input = [5u8; 64];
+    assign_random_looking_values(&mut input, 30);
 
-    start_cycle_tracking("digest_1024");
-    let r1 = black_box(blake2_inline::Blake2b::digest(black_box(&input[..])));
-    end_cycle_tracking("digest_1024");
+    let left: &[u8; 32] = input[..32].try_into().unwrap();
+    let right: &[u8; 32] = input[32..].try_into().unwrap();
 
-    start_cycle_tracking("no_copy_1024");
-    let r2 = black_box(blake2_inline::Blake2b::digest_no_copy(black_box(&input[..])));
-    end_cycle_tracking("no_copy_1024");
+    start_cycle_tracking("b3_digest_64");
+    let r1 = black_box(blake3_inline::Blake3::digest(black_box(&input[..])));
+    end_cycle_tracking("b3_digest_64");
+
+    start_cycle_tracking("b3_no_copy_64");
+    let r2 = black_box(blake3_inline::Blake3::digest_no_copy(black_box(&input[..])));
+    end_cycle_tracking("b3_no_copy_64");
+
+    start_cycle_tracking("b3_split_64");
+    let r3 = black_box(blake3_inline::Blake3::digest_64_split(black_box(left), black_box(right)));
+    end_cycle_tracking("b3_split_64");
 
     assert_eq!(r1, r2);
+    assert_eq!(r2, r3);
 }
 
-fn benchmark_1024_unaligned() {
-    let mut buffer = [5u8; 1025];
-    assign_random_looking_values(&mut buffer, 20);
+fn benchmark_blake3_64_unaligned() {
+    let mut buffer = [5u8; 65];
+    assign_random_looking_values(&mut buffer, 30);
     let input = &buffer[1..];
 
-    start_cycle_tracking("digest_1024_un");
-    let r1 = black_box(blake2_inline::Blake2b::digest(black_box(input)));
-    end_cycle_tracking("digest_1024_un");
+    start_cycle_tracking("b3_digest_64_un");
+    let r1 = black_box(blake3_inline::Blake3::digest(black_box(input)));
+    end_cycle_tracking("b3_digest_64_un");
 
-    start_cycle_tracking("no_copy_1024_un");
-    let r2 = black_box(blake2_inline::Blake2b::digest_no_copy(black_box(input)));
-    end_cycle_tracking("no_copy_1024_un");
-
-    assert_eq!(r1, r2);
-}
-
-// ==================== 2048 bytes ====================
-
-fn benchmark_2048() {
-    let mut input = [5u8; 2048];
-    assign_random_looking_values(&mut input, 20);
-
-    start_cycle_tracking("digest_2048");
-    let r1 = black_box(blake2_inline::Blake2b::digest(black_box(&input[..])));
-    end_cycle_tracking("digest_2048");
-
-    start_cycle_tracking("no_copy_2048");
-    let r2 = black_box(blake2_inline::Blake2b::digest_no_copy(black_box(&input[..])));
-    end_cycle_tracking("no_copy_2048");
+    start_cycle_tracking("b3_no_copy_64_un");
+    let r2 = black_box(blake3_inline::Blake3::digest_no_copy(black_box(input)));
+    end_cycle_tracking("b3_no_copy_64_un");
 
     assert_eq!(r1, r2);
 }
 
-fn benchmark_2048_unaligned() {
-    let mut buffer = [5u8; 2049];
-    assign_random_looking_values(&mut buffer, 20);
-    let input = &buffer[1..];
+fn benchmark_blake3_32() {
+    let mut input = [5u8; 32];
+    assign_random_looking_values(&mut input, 31);
 
-    start_cycle_tracking("digest_2048_un");
-    let r1 = black_box(blake2_inline::Blake2b::digest(black_box(input)));
-    end_cycle_tracking("digest_2048_un");
+    start_cycle_tracking("b3_digest_32");
+    let r1 = black_box(blake3_inline::Blake3::digest(black_box(&input[..])));
+    end_cycle_tracking("b3_digest_32");
 
-    start_cycle_tracking("no_copy_2048_un");
-    let r2 = black_box(blake2_inline::Blake2b::digest_no_copy(black_box(input)));
-    end_cycle_tracking("no_copy_2048_un");
+    start_cycle_tracking("b3_no_copy_32");
+    let r2 = black_box(blake3_inline::Blake3::digest_no_copy(black_box(&input[..])));
+    end_cycle_tracking("b3_no_copy_32");
 
     assert_eq!(r1, r2);
 }

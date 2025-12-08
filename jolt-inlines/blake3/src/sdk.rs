@@ -116,6 +116,88 @@ impl Blake3 {
         hasher.finalize()
     }
 
+    /// Zero-copy digest: processes input directly without copying to internal buffer.
+    /// Only supports inputs up to 64 bytes.
+    #[inline(always)]
+    pub fn digest_no_copy(input: &[u8]) -> [u8; OUTPUT_SIZE_IN_BYTES] {
+        let len = input.len();
+        if len > BLOCK_INPUT_SIZE_IN_BYTES {
+            panic!("Input too large: {len} bytes, max is {BLOCK_INPUT_SIZE_IN_BYTES}");
+        }
+
+        let mut h = IV;
+
+        // Pad input to 64 bytes if needed
+        let mut block = [0u8; BLOCK_INPUT_SIZE_IN_BYTES];
+        if len > 0 {
+            unsafe {
+                core::ptr::copy_nonoverlapping(input.as_ptr(), block.as_mut_ptr(), len);
+            }
+        }
+
+        compression_no_copy(
+            &mut h,
+            &block,
+            0,
+            len as u32,
+            FLAG_CHUNK_START | FLAG_CHUNK_END | FLAG_ROOT,
+        );
+
+        output_hash(h)
+    }
+
+    /// Optimized digest for exactly 64 bytes split into two 32-byte halves.
+    /// Avoids pointer offset calculations - fastest for 64-byte inputs.
+    #[inline(always)]
+    pub fn digest_64_split(left: &[u8; 32], right: &[u8; 32]) -> [u8; OUTPUT_SIZE_IN_BYTES] {
+        let mut h = IV;
+
+        // Build message: load 8 u32 from left, 8 u32 from right
+        let mut message = [0u32; MSG_BLOCK_LEN + COUNTER_LEN + 2];
+
+        // Load left 32 bytes (8 u32)
+        for i in 0..8 {
+            let base = i * 4;
+            message[i] = unsafe {
+                let mut tmp = core::mem::MaybeUninit::<[u8; 4]>::uninit();
+                core::ptr::copy_nonoverlapping(
+                    left.as_ptr().add(base),
+                    tmp.as_mut_ptr() as *mut u8,
+                    4,
+                );
+                u32::from_le_bytes(tmp.assume_init())
+            };
+        }
+
+        // Load right 32 bytes (8 u32)
+        for i in 0..8 {
+            let base = i * 4;
+            message[i + 8] = unsafe {
+                let mut tmp = core::mem::MaybeUninit::<[u8; 4]>::uninit();
+                core::ptr::copy_nonoverlapping(
+                    right.as_ptr().add(base),
+                    tmp.as_mut_ptr() as *mut u8,
+                    4,
+                );
+                u32::from_le_bytes(tmp.assume_init())
+            };
+        }
+
+        // counter = 0
+        message[MSG_BLOCK_LEN] = 0;
+        message[MSG_BLOCK_LEN + 1] = 0;
+        // block_len = 64
+        message[MSG_BLOCK_LEN + COUNTER_LEN] = 64;
+        // flags
+        message[MSG_BLOCK_LEN + COUNTER_LEN + 1] = FLAG_CHUNK_START | FLAG_CHUNK_END | FLAG_ROOT;
+
+        unsafe {
+            blake3_compress(h.as_mut_ptr(), message.as_ptr());
+        }
+
+        output_hash(h)
+    }
+
     /// Computes a keyed BLAKE3 hash for given input and key.
     ///
     /// Note: This only works for 64-byte inputs
@@ -192,6 +274,68 @@ fn compression_caller(
 impl Default for Blake3 {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Convert hash state to output bytes.
+#[inline(always)]
+fn output_hash(h: [u32; CHAINING_VALUE_LEN]) -> [u8; OUTPUT_SIZE_IN_BYTES] {
+    #[cfg(target_endian = "little")]
+    {
+        unsafe { core::mem::transmute(h) }
+    }
+
+    #[cfg(target_endian = "big")]
+    {
+        let mut hash = [0u8; OUTPUT_SIZE_IN_BYTES];
+        for i in 0..CHAINING_VALUE_LEN {
+            let bytes = h[i].to_le_bytes();
+            hash[i * 4..(i + 1) * 4].copy_from_slice(&bytes);
+        }
+        hash
+    }
+}
+
+/// Compress with minimal copying - uses direct pointer copy on little-endian.
+#[inline(always)]
+fn compression_no_copy(
+    hash_state: &mut [u32; CHAINING_VALUE_LEN],
+    block: &[u8],
+    counter: u64,
+    input_bytes_num: u32,
+    flags: u32,
+) {
+    let mut message = [0u32; MSG_BLOCK_LEN + COUNTER_LEN + 2];
+
+    #[cfg(target_endian = "little")]
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            block.as_ptr(),
+            message.as_mut_ptr() as *mut u8,
+            BLOCK_INPUT_SIZE_IN_BYTES,
+        );
+    }
+
+    #[cfg(target_endian = "big")]
+    {
+        for i in 0..MSG_BLOCK_LEN {
+            let offset = i * 4;
+            message[i] = u32::from_le_bytes([
+                block[offset],
+                block[offset + 1],
+                block[offset + 2],
+                block[offset + 3],
+            ]);
+        }
+    }
+
+    message[MSG_BLOCK_LEN] = counter as u32;
+    message[MSG_BLOCK_LEN + 1] = (counter >> 32) as u32;
+    message[MSG_BLOCK_LEN + COUNTER_LEN] = input_bytes_num;
+    message[MSG_BLOCK_LEN + COUNTER_LEN + 1] = flags;
+
+    unsafe {
+        blake3_compress(hash_state.as_mut_ptr(), message.as_ptr());
     }
 }
 
