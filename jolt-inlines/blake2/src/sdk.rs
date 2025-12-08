@@ -110,10 +110,22 @@ impl Blake2b {
         // Process the final block
         compression_caller(&mut self.h, &self.buffer, self.counter, true);
 
-        #[cfg(target_endian = "big")]
-        panic!("Big-endian not supported");
+        #[cfg(target_endian = "little")]
+        {
+            // Safety: [u64; 8] and [u8; 64] have identical size (64 bytes)
+            unsafe { core::mem::transmute::<[u64; STATE_VECTOR_LEN], [u8; OUTPUT_SIZE]>(self.h) }
+        }
 
-        unsafe { core::mem::transmute::<[u64; STATE_VECTOR_LEN], [u8; OUTPUT_SIZE]>(self.h) }
+        #[cfg(target_endian = "big")]
+        {
+            // For big-endian, convert each u64 to little-endian bytes
+            let mut hash = [0u8; OUTPUT_SIZE];
+            for i in 0..STATE_VECTOR_LEN {
+                let bytes = self.h[i].to_le_bytes();
+                hash[i * 8..(i + 1) * 8].copy_from_slice(&bytes);
+            }
+            hash
+        }
     }
 
     /// Computes BLAKE2b hash in one call.
@@ -188,10 +200,20 @@ impl Blake2b {
 /// Convert hash state to output bytes.
 #[inline(always)]
 fn to_bytes(h: [u64; STATE_VECTOR_LEN]) -> [u8; OUTPUT_SIZE] {
-    #[cfg(target_endian = "big")]
-    panic!("Big-endian not supported");
+    #[cfg(target_endian = "little")]
+    {
+        unsafe { core::mem::transmute(h) }
+    }
 
-    unsafe { core::mem::transmute(h) }
+    #[cfg(target_endian = "big")]
+    {
+        let mut hash = [0u8; OUTPUT_SIZE];
+        for i in 0..STATE_VECTOR_LEN {
+            let bytes = h[i].to_le_bytes();
+            hash[i * 8..(i + 1) * 8].copy_from_slice(&bytes);
+        }
+        hash
+    }
 }
 
 #[inline(always)]
@@ -201,18 +223,34 @@ fn compression_caller(
     counter: u64,
     is_final: bool,
 ) {
-    #[cfg(target_endian = "big")]
-    panic!("Big-endian not supported");
-
     let mut message = [0u64; MSG_BLOCK_LEN + 2];
     debug_assert_eq!(message_block.len(), BLOCK_INPUT_SIZE_IN_BYTES);
 
+    #[cfg(target_endian = "little")]
     unsafe {
         core::ptr::copy_nonoverlapping(
             message_block.as_ptr() as *const u64,
             message.as_mut_ptr(),
             MSG_BLOCK_LEN,
         );
+    }
+
+    #[cfg(target_endian = "big")]
+    {
+        // For big-endian, we need to convert each u64
+        for i in 0..MSG_BLOCK_LEN {
+            let offset = i * 8;
+            message[i] = u64::from_le_bytes([
+                message_block[offset],
+                message_block[offset + 1],
+                message_block[offset + 2],
+                message_block[offset + 3],
+                message_block[offset + 4],
+                message_block[offset + 5],
+                message_block[offset + 6],
+                message_block[offset + 7],
+            ]);
+        }
     }
 
     message[MSG_BLOCK_LEN] = counter;
@@ -223,19 +261,35 @@ fn compression_caller(
     }
 }
 
-/// Compress a 128-byte block (requires aligned input for direct u64 reads).
+/// Compress a 128-byte block.
 #[inline(always)]
 fn compress(hash_state: &mut [u64; STATE_VECTOR_LEN], block: &[u8], counter: u64, is_final: bool) {
-    #[cfg(target_endian = "big")]
-    panic!("Big-endian not supported");
-
     let mut message = [0u64; MSG_BLOCK_LEN + 2];
+
+    #[cfg(target_endian = "little")]
     unsafe {
         core::ptr::copy_nonoverlapping(
             block.as_ptr(),
             message.as_mut_ptr() as *mut u8,
             BLOCK_INPUT_SIZE_IN_BYTES,
         );
+    }
+
+    #[cfg(target_endian = "big")]
+    {
+        for i in 0..MSG_BLOCK_LEN {
+            let offset = i * 8;
+            message[i] = u64::from_le_bytes([
+                block[offset],
+                block[offset + 1],
+                block[offset + 2],
+                block[offset + 3],
+                block[offset + 4],
+                block[offset + 5],
+                block[offset + 6],
+                block[offset + 7],
+            ]);
+        }
     }
 
     message[MSG_BLOCK_LEN] = counter;

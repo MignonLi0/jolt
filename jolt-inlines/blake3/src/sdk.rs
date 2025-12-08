@@ -84,11 +84,25 @@ impl Blake3 {
             FLAG_CHUNK_START | FLAG_CHUNK_END | FLAG_ROOT,
         );
 
-        #[cfg(target_endian = "big")]
-        panic!("Big-endian not supported");
+        // Safety: [u32; 8] and [u8; 32] have identical size (32 bytes)
+        #[cfg(target_endian = "little")]
+        {
+            unsafe {
+                core::mem::transmute::<[u32; CHAINING_VALUE_LEN], [u8; OUTPUT_SIZE_IN_BYTES]>(
+                    self.h,
+                )
+            }
+        }
 
-        unsafe {
-            core::mem::transmute::<[u32; CHAINING_VALUE_LEN], [u8; OUTPUT_SIZE_IN_BYTES]>(self.h)
+        #[cfg(target_endian = "big")]
+        {
+            // For big-endian, convert each u32 to little-endian bytes
+            let mut hash = [0u8; OUTPUT_SIZE_IN_BYTES];
+            for i in 0..CHAINING_VALUE_LEN {
+                let bytes = self.h[i].to_le_bytes();
+                hash[i * 4..(i + 1) * 4].copy_from_slice(&bytes);
+            }
+            hash
         }
     }
 
@@ -153,18 +167,30 @@ fn compression_caller(
     input_bytes_num: u32,
     flags: u32,
 ) {
-    #[cfg(target_endian = "big")]
-    panic!("Big-endian not supported");
-
     let mut message = [0u32; MSG_BLOCK_LEN + COUNTER_LEN + 2];
     debug_assert_eq!(message_block.len(), BLOCK_INPUT_SIZE_IN_BYTES);
 
+    #[cfg(target_endian = "little")]
     unsafe {
         core::ptr::copy_nonoverlapping(
             message_block.as_ptr() as *const u32,
             message.as_mut_ptr(),
             MSG_BLOCK_LEN,
         );
+    }
+
+    #[cfg(target_endian = "big")]
+    {
+        // For big-endian, we need to convert each u32
+        for i in 0..MSG_BLOCK_LEN {
+            let offset = i * 4;
+            message[i] = u32::from_le_bytes([
+                message_block[offset],
+                message_block[offset + 1],
+                message_block[offset + 2],
+                message_block[offset + 3],
+            ]);
+        }
     }
 
     message[MSG_BLOCK_LEN] = counter as u32;
@@ -186,10 +212,20 @@ impl Default for Blake3 {
 /// Convert hash state to output bytes.
 #[inline(always)]
 fn to_bytes(h: [u32; CHAINING_VALUE_LEN]) -> [u8; OUTPUT_SIZE_IN_BYTES] {
-    #[cfg(target_endian = "big")]
-    panic!("Big-endian not supported");
+    #[cfg(target_endian = "little")]
+    {
+        unsafe { core::mem::transmute(h) }
+    }
 
-    unsafe { core::mem::transmute(h) }
+    #[cfg(target_endian = "big")]
+    {
+        let mut hash = [0u8; OUTPUT_SIZE_IN_BYTES];
+        for i in 0..CHAINING_VALUE_LEN {
+            let bytes = h[i].to_le_bytes();
+            hash[i * 4..(i + 1) * 4].copy_from_slice(&bytes);
+        }
+        hash
+    }
 }
 
 /// Compress a 64-byte block.
@@ -201,16 +237,28 @@ fn compress(
     input_bytes_num: u32,
     flags: u32,
 ) {
-    #[cfg(target_endian = "big")]
-    panic!("Big-endian not supported");
-
     let mut message = [0u32; MSG_BLOCK_LEN + COUNTER_LEN + 2];
+
+    #[cfg(target_endian = "little")]
     unsafe {
         core::ptr::copy_nonoverlapping(
             block.as_ptr(),
             message.as_mut_ptr() as *mut u8,
             BLOCK_INPUT_SIZE_IN_BYTES,
         );
+    }
+
+    #[cfg(target_endian = "big")]
+    {
+        for i in 0..MSG_BLOCK_LEN {
+            let offset = i * 4;
+            message[i] = u32::from_le_bytes([
+                block[offset],
+                block[offset + 1],
+                block[offset + 2],
+                block[offset + 3],
+            ]);
+        }
     }
 
     message[MSG_BLOCK_LEN] = counter as u32;

@@ -107,17 +107,28 @@ impl Keccak256 {
 
         self.absorb_buffer();
 
-        #[cfg(target_endian = "big")]
-        panic!("Big-endian not supported");
-
         let mut hash = [0u8; HASH_LEN];
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                self.state.as_ptr() as *const u8,
-                hash.as_mut_ptr(),
-                HASH_LEN,
-            );
+
+        #[cfg(target_endian = "little")]
+        {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    self.state.as_ptr() as *const u8,
+                    hash.as_mut_ptr(),
+                    HASH_LEN,
+                );
+            }
         }
+
+        #[cfg(target_endian = "big")]
+        {
+            // For big-endian, convert each u64 to little-endian bytes
+            for i in 0..HASH_LEN / 8 {
+                let bytes = self.state[i].to_le_bytes();
+                hash[i * 8..(i + 1) * 8].copy_from_slice(&bytes);
+            }
+        }
+
         hash
     }
 
@@ -158,14 +169,25 @@ impl Keccak256 {
     /// Absorbs a full block from the internal buffer into the state.
     #[inline(always)]
     fn absorb_buffer(&mut self) {
-        #[cfg(target_endian = "big")]
-        panic!("Big-endian not supported");
-
+        #[cfg(target_endian = "little")]
         unsafe {
+            // On little-endian, directly XOR the buffer as u64 words
             let buffer_words = self.buffer.as_ptr() as *const u64;
             for i in 0..RATE_IN_U64 {
                 self.state[i] ^= *buffer_words.add(i);
             }
+        }
+
+        #[cfg(target_endian = "big")]
+        {
+            // For big-endian, convert each word from little-endian bytes
+            for i in 0..RATE_IN_U64 {
+                let word = u64::from_le_bytes(self.buffer[i * 8..(i + 1) * 8].try_into().unwrap());
+                self.state[i] ^= word;
+            }
+        }
+
+        unsafe {
             keccak_f(self.state.as_mut_ptr());
         }
         self.buffer_len = 0;
@@ -181,13 +203,27 @@ impl Default for Keccak256 {
 /// Convert state to output hash bytes.
 #[inline(always)]
 fn to_bytes(state: [u64; 25]) -> [u8; HASH_LEN] {
-    #[cfg(target_endian = "big")]
-    panic!("Big-endian not supported");
-
     let mut hash = [0u8; HASH_LEN];
-    unsafe {
-        core::ptr::copy_nonoverlapping(state.as_ptr() as *const u8, hash.as_mut_ptr(), HASH_LEN);
+
+    #[cfg(target_endian = "little")]
+    {
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                state.as_ptr() as *const u8,
+                hash.as_mut_ptr(),
+                HASH_LEN,
+            );
+        }
     }
+
+    #[cfg(target_endian = "big")]
+    {
+        for i in 0..HASH_LEN / 8 {
+            let bytes = state[i].to_le_bytes();
+            hash[i * 8..(i + 1) * 8].copy_from_slice(&bytes);
+        }
+    }
+
     hash
 }
 
