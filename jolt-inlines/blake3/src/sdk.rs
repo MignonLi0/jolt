@@ -254,49 +254,6 @@ fn to_bytes(h: [u32; CHAINING_VALUE_LEN]) -> [u8; OUTPUT_SIZE_IN_BYTES] {
     }
 }
 
-/// Compress a 64-byte block.
-#[inline(always)]
-fn compress(
-    hash_state: &mut [u32; CHAINING_VALUE_LEN],
-    block: &[u8],
-    counter: u64,
-    input_bytes_num: u32,
-    flags: u32,
-) {
-    let mut message = [0u32; MSG_BLOCK_LEN + COUNTER_LEN + 2];
-
-    #[cfg(target_endian = "little")]
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            block.as_ptr(),
-            message.as_mut_ptr() as *mut u8,
-            BLOCK_INPUT_SIZE_IN_BYTES,
-        );
-    }
-
-    #[cfg(target_endian = "big")]
-    {
-        for i in 0..MSG_BLOCK_LEN {
-            let offset = i * 4;
-            message[i] = u32::from_le_bytes([
-                block[offset],
-                block[offset + 1],
-                block[offset + 2],
-                block[offset + 3],
-            ]);
-        }
-    }
-
-    message[MSG_BLOCK_LEN] = counter as u32;
-    message[MSG_BLOCK_LEN + 1] = (counter >> 32) as u32;
-    message[MSG_BLOCK_LEN + COUNTER_LEN] = input_bytes_num;
-    message[MSG_BLOCK_LEN + COUNTER_LEN + 1] = flags;
-
-    unsafe {
-        blake3_compress(hash_state.as_mut_ptr(), message.as_ptr());
-    }
-}
-
 /// Compress with direct copy to message array (no intermediate buffer).
 /// Optimized for virtual cycles by avoiding double-copy.
 #[inline(always)]
@@ -509,6 +466,76 @@ mod tests {
             assert_eq!(
                 result, expected,
                 "keyed digest mismatch for input={input:02x?} and random key={key:x?}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_keyed_hash64_matches_keyed_hash() {
+        // Test that keyed_hash64 produces the same result as keyed_hash for 64-byte inputs
+        for _ in 0..1000 {
+            let input_vec = generate_random_bytes(64);
+            let mut input = [0u8; 64];
+            input.copy_from_slice(&input_vec);
+
+            let key_bytes = generate_random_bytes(CHAINING_VALUE_LEN * 4);
+            let mut key = [0u32; CHAINING_VALUE_LEN];
+            key.copy_from_slice(&bytes_to_u32_vec(&key_bytes));
+
+            let result_hash = Blake3::keyed_hash(&input, key);
+            let result_hash64 = Blake3::keyed_hash64(&input, key);
+
+            assert_eq!(
+                result_hash, result_hash64,
+                "keyed_hash vs keyed_hash64 mismatch for input={input:02x?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_keyed_hash64_aligned_vs_unaligned() {
+        // Test with various keys
+        let test_keys: [[u32; 8]; 3] = [
+            [0u32; 8],       // all zeros
+            [0xFFFFFFFF; 8], // all ones
+            [
+                0x12345678, 0x9ABCDEF0, 0x11111111, 0x22222222, 0x33333333, 0x44444444, 0x55555555,
+                0x66666666,
+            ], // mixed
+        ];
+
+        for key in &test_keys {
+            // Create aligned input
+            let mut aligned = [0u8; 64];
+            for (i, b) in aligned.iter_mut().enumerate() {
+                *b = (i * 37 + 11) as u8;
+            }
+
+            // Create unaligned input (offset by 1 byte)
+            let mut unaligned_buf = [0u8; 65];
+            unaligned_buf[1..].copy_from_slice(&aligned);
+
+            // Verify alignment difference
+            assert_ne!(
+                aligned.as_ptr() as usize % 8,
+                unaligned_buf[1..].as_ptr() as usize % 8,
+                "Test setup error: should have different alignment"
+            );
+
+            // keyed_hash64 requires &[u8; 64], so we need to convert
+            let aligned_result = Blake3::keyed_hash64(&aligned, *key);
+
+            // For unaligned, use keyed_hash (which accepts &[u8])
+            let unaligned_result = Blake3::keyed_hash(&unaligned_buf[1..], *key);
+
+            // Both should match the reference
+            let expected = compute_keyed_expected_result(&aligned, *key);
+
+            assert_eq!(aligned_result, expected, "keyed_hash64 aligned mismatch");
+            assert_eq!(unaligned_result, expected, "keyed_hash unaligned mismatch");
+            assert_eq!(
+                aligned_result, unaligned_result,
+                "aligned vs unaligned mismatch"
             );
         }
     }
