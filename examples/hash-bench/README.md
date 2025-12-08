@@ -13,28 +13,35 @@ RUST_LOG=info cargo run --release
 
 ## Blake2b Results (RV64IMAC Cycles)
 
-| Size | `digest()` | `digest_no_copy()` | `digest_64_split()` | Best | Improvement |
-|------|------------|-------------------|---------------------|------|-------------|
-| 64B | 603 | 341 | **236** | split | **-61%** |
-| 256B | 831 | **326** | - | no_copy | **-61%** |
+| Size | `digest()` | `digest_no_copy()` | `digest_64_split()` | Improvement |
+|------|------------|-------------------|---------------------|-------------|
+| 64B | 603 | 341 | **237** | **-61%** |
+| 128B | 570 | **192** | - | **-66%** |
+| 256B | 830 | **327** | - | **-61%** |
+| 512B | 1,346 | **590** | - | **-56%** |
 
 ---
 
 ## Blake3 Results (RV64IMAC Cycles)
 
-| Size | `digest()` | `digest_no_copy()` | `digest_64_split()` | Best | Improvement |
-|------|------------|-------------------|---------------------|------|-------------|
-| 32B | 294 | **122** | - | no_copy | **-59%** |
-| 64B | 272 | **147** | 206 | no_copy | **-46%** |
+*Note: Blake3 only supports up to 64 bytes input*
+
+| Size | `digest()` | `digest_no_copy()` | `digest_64_split()` | Improvement |
+|------|------------|-------------------|---------------------|-------------|
+| 32B | 301 | **122** | - | **-59%** |
+| 64B | 267 | **147** | 205 | **-45%** |
 
 ---
 
 ## Keccak256 Results (RV64IMAC Cycles)
 
-| Size | `digest()` | `digest_no_copy()` | `digest_64_split()` | Best | Improvement |
-|------|------------|-------------------|---------------------|------|-------------|
-| 32B | 719 | **361** | - | no_copy | **-50%** |
-| 64B | 729 | 385 | **292** | split | **-60%** |
+| Size | `digest()` | `digest_no_copy()` | `digest_64_split()` | Improvement |
+|------|------------|-------------------|---------------------|-------------|
+| 32B | 697 | **360** | - | **-48%** |
+| 64B | 704 | 384 | **292** | **-59%** |
+| 136B | 848 | **377** | - | **-56%** |
+| 256B | 935 | **499** | - | **-47%** |
+| 512B | 1,323 | **639** | - | **-52%** |
 
 ---
 
@@ -42,26 +49,31 @@ RUST_LOG=info cargo run --release
 
 | Hash | Size | Best Function | Cycles | vs Original |
 |------|------|---------------|--------|-------------|
-| **Blake2b** | 64B | `digest_64_split()` | **236** | -61% |
-| **Blake2b** | 256B | `digest_no_copy()` | **326** | -61% |
+| **Blake2b** | 64B | `digest_64_split()` | **237** | -61% |
+| **Blake2b** | 128B | `digest_no_copy()` | **192** | -66% |
+| **Blake2b** | 256B | `digest_no_copy()` | **327** | -61% |
+| **Blake2b** | 512B | `digest_no_copy()` | **590** | -56% |
 | **Blake3** | 32B | `digest_no_copy()` | **122** | -59% |
-| **Blake3** | 64B | `digest_no_copy()` | **147** | -46% |
-| **Keccak256** | 32B | `digest_no_copy()` | **361** | -50% |
-| **Keccak256** | 64B | `digest_64_split()` | **292** | -60% |
+| **Blake3** | 64B | `digest_no_copy()` | **147** | -45% |
+| **Keccak256** | 32B | `digest_no_copy()` | **360** | -48% |
+| **Keccak256** | 64B | `digest_64_split()` | **292** | -59% |
+| **Keccak256** | 136B | `digest_no_copy()` | **377** | -56% |
+| **Keccak256** | 256B | `digest_no_copy()` | **499** | -47% |
+| **Keccak256** | 512B | `digest_no_copy()` | **639** | -52% |
 
 ---
 
 ## Key Findings
 
-1. **Zero-copy wins**: Avoiding internal buffer copy saves 46-61% cycles
-2. **Blake2b & Keccak256**: `digest_64_split()` is fastest for 64B (u64 words)
-3. **Blake3**: `digest_no_copy()` is fastest (u32 words make split slower)
-4. **Consistent gains**: All hash functions achieve ~50-60% improvement
+1. **Consistent 45-66% improvement** across all hash functions and sizes
+2. **Blake2b 128B is most efficient**: 192 cycles (-66%)
+3. **Blake3 32B is fastest overall**: 122 cycles
+4. **Split function best for 64B** on Blake2b and Keccak256 (u64 words)
 
 ## Recommendations
 
-| Hash | 32B | 64B | >64B |
-|------|-----|-----|------|
-| Blake2b | `digest_no_copy()` | `digest_64_split()` | `digest_no_copy()` |
-| Blake3 | `digest_no_copy()` | `digest_no_copy()` | N/A (max 64B) |
-| Keccak256 | `digest_no_copy()` | `digest_64_split()` | `digest_no_copy()` |
+| Hash | 32B | 64B | 128B+ |
+|------|-----|-----|-------|
+| Blake2b | `no_copy` | `split` | `no_copy` |
+| Blake3 | `no_copy` | `no_copy` | N/A (max 64B) |
+| Keccak256 | `no_copy` | `split` | `no_copy` |

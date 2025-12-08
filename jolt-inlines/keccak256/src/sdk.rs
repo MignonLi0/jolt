@@ -93,13 +93,13 @@ impl Keccak256 {
         // If buffer_len == RATE_IN_BYTES-1 both markers land in the same byte (0x01 | 0x80 = 0x81)
         self.buffer[self.buffer_len] = 0x01;
 
-        // Zero the remaining bytes (except the last byte)
-        if self.buffer_len + 1 < RATE_IN_BYTES - 1 {
+        // Zero the remaining bytes (including the last byte if needed)
+        if self.buffer_len + 1 < RATE_IN_BYTES {
             unsafe {
                 core::ptr::write_bytes(
                     self.buffer.as_mut_ptr().add(self.buffer_len + 1),
                     0,
-                    RATE_IN_BYTES - self.buffer_len - 2,
+                    RATE_IN_BYTES - self.buffer_len - 1,
                 );
             }
         }
@@ -187,7 +187,7 @@ impl Keccak256 {
 
         // Build padded block: 64 bytes data + padding
         // Rate is 136 bytes, so we have 64 bytes data + 72 bytes padding
-        
+
         // XOR left 32 bytes (4 u64) into state[0..4]
         for i in 0..4 {
             let base = i * 8;
