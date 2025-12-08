@@ -143,9 +143,21 @@ impl Keccak256 {
         let full_blocks = len / RATE_IN_BYTES;
         let mut offset = 0;
 
-        for _ in 0..full_blocks {
-            absorb(&mut state, &input[offset..offset + RATE_IN_BYTES]);
-            offset += RATE_IN_BYTES;
+        // Check alignment once, then use branch-free loop
+        let is_aligned = input.as_ptr() as usize % 8 == 0;
+
+        if is_aligned {
+            // Aligned fast path - no per-block branch
+            for _ in 0..full_blocks {
+                absorb_aligned(&mut state, &input[offset..offset + RATE_IN_BYTES]);
+                offset += RATE_IN_BYTES;
+            }
+        } else {
+            // Unaligned path - no per-block branch
+            for _ in 0..full_blocks {
+                absorb_unaligned(&mut state, &input[offset..offset + RATE_IN_BYTES]);
+                offset += RATE_IN_BYTES;
+            }
         }
 
         // Final block with Keccak padding - use direct absorb
@@ -215,31 +227,32 @@ fn to_bytes(state: [u64; 25]) -> [u8; HASH_LEN] {
     hash
 }
 
-/// Absorb a 136-byte block into state (handles aligned/unaligned input).
+/// Absorb a 136-byte aligned block into state.
+/// Caller must ensure the block pointer is 8-byte aligned.
 #[inline(always)]
-fn absorb(state: &mut [u64; 25], block: &[u8]) {
-    let ptr = block.as_ptr();
-
-    if ptr as usize % 8 == 0 {
-        // Aligned: direct u64 reads (fast path)
-        unsafe {
-            let block_words = ptr as *const u64;
-            for i in 0..RATE_IN_U64 {
-                state[i] ^= *block_words.add(i);
-            }
-        }
-    } else {
-        // Unaligned: safe byte-by-byte reads
+fn absorb_aligned(state: &mut [u64; 25], block: &[u8]) {
+    unsafe {
+        let block_words = block.as_ptr() as *const u64;
         for i in 0..RATE_IN_U64 {
-            let word = unsafe {
-                let mut tmp = core::mem::MaybeUninit::<[u8; 8]>::uninit();
-                core::ptr::copy_nonoverlapping(ptr.add(i * 8), tmp.as_mut_ptr() as *mut u8, 8);
-                u64::from_le_bytes(tmp.assume_init())
-            };
-            state[i] ^= word;
+            state[i] ^= *block_words.add(i);
         }
+        keccak_f(state.as_mut_ptr());
     }
+}
 
+/// Absorb a 136-byte unaligned block into state.
+/// Safe for any alignment.
+#[inline(always)]
+fn absorb_unaligned(state: &mut [u64; 25], block: &[u8]) {
+    let ptr = block.as_ptr();
+    for i in 0..RATE_IN_U64 {
+        let word = unsafe {
+            let mut tmp = core::mem::MaybeUninit::<[u8; 8]>::uninit();
+            core::ptr::copy_nonoverlapping(ptr.add(i * 8), tmp.as_mut_ptr() as *mut u8, 8);
+            u64::from_le_bytes(tmp.assume_init())
+        };
+        state[i] ^= word;
+    }
     unsafe {
         keccak_f(state.as_mut_ptr());
     }
