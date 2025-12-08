@@ -140,6 +140,100 @@ impl Keccak256 {
         hasher.finalize()
     }
 
+    /// Zero-copy digest: processes input directly without internal buffer copy.
+    /// Optimized for single-block inputs (≤136 bytes).
+    #[inline(always)]
+    pub fn digest_no_copy(input: &[u8]) -> [u8; HASH_LEN] {
+        let len = input.len();
+        let mut state = [0u64; 25];
+
+        // Process complete blocks directly from input
+        let full_blocks = len / RATE_IN_BYTES;
+        let mut offset = 0;
+
+        for _ in 0..full_blocks {
+            absorb_block_no_copy(&mut state, &input[offset..offset + RATE_IN_BYTES]);
+            offset += RATE_IN_BYTES;
+        }
+
+        // Process final partial block with padding
+        let remaining = len - offset;
+        let mut final_block = [0u8; RATE_IN_BYTES];
+
+        if remaining > 0 {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    input.as_ptr().add(offset),
+                    final_block.as_mut_ptr(),
+                    remaining,
+                );
+            }
+        }
+
+        // Apply Keccak padding: 0x01 at start, 0x80 at end
+        final_block[remaining] = 0x01;
+        final_block[RATE_IN_BYTES - 1] |= 0x80;
+
+        absorb_block_no_copy(&mut state, &final_block);
+
+        output_hash(state)
+    }
+
+    /// Optimized digest for exactly 64 bytes split into two 32-byte halves.
+    /// Avoids pointer offset calculations - fastest for 64-byte aligned inputs.
+    #[inline(always)]
+    pub fn digest_64_split(left: &[u8; 32], right: &[u8; 32]) -> [u8; HASH_LEN] {
+        let mut state = [0u64; 25];
+
+        // Build padded block: 64 bytes data + padding
+        // Rate is 136 bytes, so we have 64 bytes data + 72 bytes padding
+        
+        // XOR left 32 bytes (4 u64) into state[0..4]
+        for i in 0..4 {
+            let base = i * 8;
+            let word = unsafe {
+                let mut tmp = core::mem::MaybeUninit::<[u8; 8]>::uninit();
+                core::ptr::copy_nonoverlapping(
+                    left.as_ptr().add(base),
+                    tmp.as_mut_ptr() as *mut u8,
+                    8,
+                );
+                u64::from_le_bytes(tmp.assume_init())
+            };
+            state[i] ^= word;
+        }
+
+        // XOR right 32 bytes (4 u64) into state[4..8]
+        for i in 0..4 {
+            let base = i * 8;
+            let word = unsafe {
+                let mut tmp = core::mem::MaybeUninit::<[u8; 8]>::uninit();
+                core::ptr::copy_nonoverlapping(
+                    right.as_ptr().add(base),
+                    tmp.as_mut_ptr() as *mut u8,
+                    8,
+                );
+                u64::from_le_bytes(tmp.assume_init())
+            };
+            state[i + 4] ^= word;
+        }
+
+        // Apply padding at byte 64: 0x01
+        // byte 64 is in state[8], at byte offset 0 within that u64
+        state[8] ^= 0x01;
+
+        // Apply padding at byte 135: 0x80
+        // byte 135 is in state[16], at byte offset 7 within that u64
+        // 135 / 8 = 16, 135 % 8 = 7
+        state[16] ^= 0x80u64 << 56;
+
+        unsafe {
+            keccak_f(state.as_mut_ptr());
+        }
+
+        output_hash(state)
+    }
+
     /// Absorbs a full block from the internal buffer into the state.
     #[inline(always)]
     fn absorb_buffer(&mut self) {
@@ -171,6 +265,57 @@ impl Keccak256 {
 impl Default for Keccak256 {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Convert state to output hash bytes.
+#[inline(always)]
+fn output_hash(state: [u64; 25]) -> [u8; HASH_LEN] {
+    let mut hash = [0u8; HASH_LEN];
+
+    #[cfg(target_endian = "little")]
+    {
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                state.as_ptr() as *const u8,
+                hash.as_mut_ptr(),
+                HASH_LEN,
+            );
+        }
+    }
+
+    #[cfg(target_endian = "big")]
+    {
+        for i in 0..HASH_LEN / 8 {
+            let bytes = state[i].to_le_bytes();
+            hash[i * 8..(i + 1) * 8].copy_from_slice(&bytes);
+        }
+    }
+
+    hash
+}
+
+/// Absorb a full rate block into state without internal buffer copy.
+#[inline(always)]
+fn absorb_block_no_copy(state: &mut [u64; 25], block: &[u8]) {
+    #[cfg(target_endian = "little")]
+    unsafe {
+        let block_words = block.as_ptr() as *const u64;
+        for i in 0..RATE_IN_U64 {
+            state[i] ^= *block_words.add(i);
+        }
+    }
+
+    #[cfg(target_endian = "big")]
+    {
+        for i in 0..RATE_IN_U64 {
+            let word = u64::from_le_bytes(block[i * 8..(i + 1) * 8].try_into().unwrap());
+            state[i] ^= word;
+        }
+    }
+
+    unsafe {
+        keccak_f(state.as_mut_ptr());
     }
 }
 

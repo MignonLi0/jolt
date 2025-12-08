@@ -1,6 +1,6 @@
 # Hash Benchmark
 
-Performance benchmarks for Blake2b and Blake3 digest implementations in `jolt-inlines`.
+Performance benchmarks for hash implementations in `jolt-inlines`.
 
 ## How to Run
 
@@ -13,55 +13,28 @@ RUST_LOG=info cargo run --release
 
 ## Blake2b Results (RV64IMAC Cycles)
 
-### Implementations
-
-| Function | Description |
-|----------|-------------|
-| `digest()` | Original with internal buffer copy |
-| `digest_no_copy()` | Zero-copy, processes blocks directly |
-| `digest_64_split()` | Two `&[u8;32]` inputs, fastest for 64B |
-
-### 64 Bytes
-
-| Implementation | Aligned | Unaligned | Improvement |
-|---------------|---------|-----------|-------------|
-| `digest()` | 605 | 684 | baseline |
-| `digest_no_copy()` | 343 | 431 | -43% |
-| **`digest_64_split()`** | **239** | N/A | **-60%** |
-
-### 256 Bytes
-
-| Implementation | Aligned | Unaligned | Improvement |
-|---------------|---------|-----------|-------------|
-| `digest()` | 832 | 1,285 | baseline |
-| **`digest_no_copy()`** | **329** | 630 | **-60%** |
+| Size | `digest()` | `digest_no_copy()` | `digest_64_split()` | Best | Improvement |
+|------|------------|-------------------|---------------------|------|-------------|
+| 64B | 603 | 341 | **236** | split | **-61%** |
+| 256B | 831 | **326** | - | no_copy | **-61%** |
 
 ---
 
 ## Blake3 Results (RV64IMAC Cycles)
 
-### Implementations
+| Size | `digest()` | `digest_no_copy()` | `digest_64_split()` | Best | Improvement |
+|------|------------|-------------------|---------------------|------|-------------|
+| 32B | 294 | **122** | - | no_copy | **-59%** |
+| 64B | 272 | **147** | 206 | no_copy | **-46%** |
 
-| Function | Description |
-|----------|-------------|
-| `digest()` | Original with internal buffer copy |
-| `digest_no_copy()` | Zero-copy, direct processing |
-| `digest_64_split()` | Two `&[u8;32]` inputs |
+---
 
-### 64 Bytes
+## Keccak256 Results (RV64IMAC Cycles)
 
-| Implementation | Aligned | Unaligned | Improvement |
-|---------------|---------|-----------|-------------|
-| `digest()` | 272 | 363 | baseline |
-| **`digest_no_copy()`** | **149** | 236 | **-45%** |
-| `digest_64_split()` | 208 | N/A | -24% |
-
-### 32 Bytes
-
-| Implementation | Aligned | Improvement |
-|---------------|---------|-------------|
-| `digest()` | 294 | baseline |
-| **`digest_no_copy()`** | **122** | **-59%** |
+| Size | `digest()` | `digest_no_copy()` | `digest_64_split()` | Best | Improvement |
+|------|------------|-------------------|---------------------|------|-------------|
+| 32B | 719 | **361** | - | no_copy | **-50%** |
+| 64B | 729 | 385 | **292** | split | **-60%** |
 
 ---
 
@@ -69,22 +42,26 @@ RUST_LOG=info cargo run --release
 
 | Hash | Size | Best Function | Cycles | vs Original |
 |------|------|---------------|--------|-------------|
-| Blake2b | 64B | `digest_64_split()` | **239** | -60% |
-| Blake2b | 256B | `digest_no_copy()` | **329** | -60% |
-| Blake3 | 32B | `digest_no_copy()` | **122** | -59% |
-| Blake3 | 64B | `digest_no_copy()` | **149** | -45% |
+| **Blake2b** | 64B | `digest_64_split()` | **236** | -61% |
+| **Blake2b** | 256B | `digest_no_copy()` | **326** | -61% |
+| **Blake3** | 32B | `digest_no_copy()` | **122** | -59% |
+| **Blake3** | 64B | `digest_no_copy()` | **147** | -46% |
+| **Keccak256** | 32B | `digest_no_copy()` | **361** | -50% |
+| **Keccak256** | 64B | `digest_64_split()` | **292** | -60% |
+
+---
 
 ## Key Findings
 
-1. **Blake2b**: `digest_64_split()` is fastest for 64B (-60%), uses u64 words
-2. **Blake3**: `digest_no_copy()` is fastest (-45% to -59%), uses u32 words
-3. **Unaligned penalty**: +30% to +90% depending on size
-4. **Zero-copy wins**: Avoiding internal buffer copy saves 40-60% cycles
+1. **Zero-copy wins**: Avoiding internal buffer copy saves 46-61% cycles
+2. **Blake2b & Keccak256**: `digest_64_split()` is fastest for 64B (u64 words)
+3. **Blake3**: `digest_no_copy()` is fastest (u32 words make split slower)
+4. **Consistent gains**: All hash functions achieve ~50-60% improvement
 
 ## Recommendations
 
-| Use Case | Blake2b | Blake3 |
-|----------|---------|--------|
-| 64 bytes (aligned) | `digest_64_split()` | `digest_no_copy()` |
-| 64 bytes (unaligned) | `digest_no_copy()` | `digest_no_copy()` |
-| >64 bytes | `digest_no_copy()` | N/A (max 64B) |
+| Hash | 32B | 64B | >64B |
+|------|-----|-----|------|
+| Blake2b | `digest_no_copy()` | `digest_64_split()` | `digest_no_copy()` |
+| Blake3 | `digest_no_copy()` | `digest_no_copy()` | N/A (max 64B) |
+| Keccak256 | `digest_no_copy()` | `digest_64_split()` | `digest_no_copy()` |

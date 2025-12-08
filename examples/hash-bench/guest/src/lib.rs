@@ -6,6 +6,7 @@ use jolt::{end_cycle_tracking, start_cycle_tracking};
 
 use jolt_inlines_blake2 as blake2_inline;
 use jolt_inlines_blake3 as blake3_inline;
+use jolt_inlines_keccak256 as keccak_inline;
 
 #[jolt::provable(
     max_output_size = 4096,
@@ -16,14 +17,15 @@ use jolt_inlines_blake3 as blake3_inline;
 fn hashbench() -> [u8; 32] {
     // Blake2b
     benchmark_blake2_64();
-    benchmark_blake2_64_unaligned();
     benchmark_blake2_256();
-    benchmark_blake2_256_unaligned();
 
     // Blake3
     benchmark_blake3_64();
-    benchmark_blake3_64_unaligned();
     benchmark_blake3_32();
+
+    // Keccak256
+    benchmark_keccak_64();
+    benchmark_keccak_32();
 
     return [0; 32];
 }
@@ -64,22 +66,6 @@ fn benchmark_blake2_64() {
     assert_eq!(r2, r3);
 }
 
-fn benchmark_blake2_64_unaligned() {
-    let mut buffer = [5u8; 65];
-    assign_random_looking_values(&mut buffer, 20);
-    let input = &buffer[1..];
-
-    start_cycle_tracking("b2_digest_64_un");
-    let r1 = black_box(blake2_inline::Blake2b::digest(black_box(input)));
-    end_cycle_tracking("b2_digest_64_un");
-
-    start_cycle_tracking("b2_no_copy_64_un");
-    let r2 = black_box(blake2_inline::Blake2b::digest_no_copy(black_box(input)));
-    end_cycle_tracking("b2_no_copy_64_un");
-
-    assert_eq!(r1, r2);
-}
-
 fn benchmark_blake2_256() {
     let mut input = [5u8; 256];
     assign_random_looking_values(&mut input, 20);
@@ -91,22 +77,6 @@ fn benchmark_blake2_256() {
     start_cycle_tracking("b2_no_copy_256");
     let r2 = black_box(blake2_inline::Blake2b::digest_no_copy(black_box(&input[..])));
     end_cycle_tracking("b2_no_copy_256");
-
-    assert_eq!(r1, r2);
-}
-
-fn benchmark_blake2_256_unaligned() {
-    let mut buffer = [5u8; 257];
-    assign_random_looking_values(&mut buffer, 20);
-    let input = &buffer[1..];
-
-    start_cycle_tracking("b2_digest_256_un");
-    let r1 = black_box(blake2_inline::Blake2b::digest(black_box(input)));
-    end_cycle_tracking("b2_digest_256_un");
-
-    start_cycle_tracking("b2_no_copy_256_un");
-    let r2 = black_box(blake2_inline::Blake2b::digest_no_copy(black_box(input)));
-    end_cycle_tracking("b2_no_copy_256_un");
 
     assert_eq!(r1, r2);
 }
@@ -136,22 +106,6 @@ fn benchmark_blake3_64() {
     assert_eq!(r2, r3);
 }
 
-fn benchmark_blake3_64_unaligned() {
-    let mut buffer = [5u8; 65];
-    assign_random_looking_values(&mut buffer, 30);
-    let input = &buffer[1..];
-
-    start_cycle_tracking("b3_digest_64_un");
-    let r1 = black_box(blake3_inline::Blake3::digest(black_box(input)));
-    end_cycle_tracking("b3_digest_64_un");
-
-    start_cycle_tracking("b3_no_copy_64_un");
-    let r2 = black_box(blake3_inline::Blake3::digest_no_copy(black_box(input)));
-    end_cycle_tracking("b3_no_copy_64_un");
-
-    assert_eq!(r1, r2);
-}
-
 fn benchmark_blake3_32() {
     let mut input = [5u8; 32];
     assign_random_looking_values(&mut input, 31);
@@ -163,6 +117,46 @@ fn benchmark_blake3_32() {
     start_cycle_tracking("b3_no_copy_32");
     let r2 = black_box(blake3_inline::Blake3::digest_no_copy(black_box(&input[..])));
     end_cycle_tracking("b3_no_copy_32");
+
+    assert_eq!(r1, r2);
+}
+
+// ==================== Keccak256 ====================
+
+fn benchmark_keccak_64() {
+    let mut input = [5u8; 64];
+    assign_random_looking_values(&mut input, 40);
+
+    let left: &[u8; 32] = input[..32].try_into().unwrap();
+    let right: &[u8; 32] = input[32..].try_into().unwrap();
+
+    start_cycle_tracking("kec_digest_64");
+    let r1 = black_box(keccak_inline::Keccak256::digest(black_box(&input[..])));
+    end_cycle_tracking("kec_digest_64");
+
+    start_cycle_tracking("kec_no_copy_64");
+    let r2 = black_box(keccak_inline::Keccak256::digest_no_copy(black_box(&input[..])));
+    end_cycle_tracking("kec_no_copy_64");
+
+    start_cycle_tracking("kec_split_64");
+    let r3 = black_box(keccak_inline::Keccak256::digest_64_split(black_box(left), black_box(right)));
+    end_cycle_tracking("kec_split_64");
+
+    assert_eq!(r1, r2);
+    assert_eq!(r2, r3);
+}
+
+fn benchmark_keccak_32() {
+    let mut input = [5u8; 32];
+    assign_random_looking_values(&mut input, 41);
+
+    start_cycle_tracking("kec_digest_32");
+    let r1 = black_box(keccak_inline::Keccak256::digest(black_box(&input[..])));
+    end_cycle_tracking("kec_digest_32");
+
+    start_cycle_tracking("kec_no_copy_32");
+    let r2 = black_box(keccak_inline::Keccak256::digest_no_copy(black_box(&input[..])));
+    end_cycle_tracking("kec_no_copy_32");
 
     assert_eq!(r1, r2);
 }
