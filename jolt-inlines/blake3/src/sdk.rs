@@ -1,7 +1,7 @@
 //! This file provides high-level API to use BLAKE3 compression, both in host and guest mode.
 use crate::{
     BLOCK_INPUT_SIZE_IN_BYTES, CHAINING_VALUE_LEN, COUNTER_LEN, FLAG_CHUNK_END, FLAG_CHUNK_START,
-    FLAG_KEYED_HASH, FLAG_ROOT, IV, MSG_BLOCK_LEN, OUTPUT_SIZE_IN_BYTES,
+    FLAG_ROOT, IV, MSG_BLOCK_LEN, OUTPUT_SIZE_IN_BYTES,
 };
 
 pub struct Blake3 {
@@ -125,64 +125,6 @@ impl Blake3 {
         );
         to_bytes(h)
     }
-
-    /// Computes a keyed BLAKE3 hash (max 64 bytes input).
-    /// Optimized for virtual cycles by avoiding intermediate buffer.
-    #[inline(always)]
-    pub fn keyed_hash(input: &[u8], key: [u32; CHAINING_VALUE_LEN]) -> [u8; OUTPUT_SIZE_IN_BYTES] {
-        let len = input.len();
-        if len > BLOCK_INPUT_SIZE_IN_BYTES {
-            panic!("Input too large: {len} bytes, max is {BLOCK_INPUT_SIZE_IN_BYTES}");
-        }
-
-        let mut h = key;
-        compress_direct(
-            &mut h,
-            input,
-            0,
-            len as u32,
-            FLAG_CHUNK_START | FLAG_CHUNK_END | FLAG_ROOT | FLAG_KEYED_HASH,
-        );
-        to_bytes(h)
-    }
-
-    /// Computes a keyed BLAKE3 hash for exactly 64 bytes input.
-    /// Uses specialized instruction that embeds counter/flags as constants.
-    #[inline(always)]
-    pub fn keyed_hash64(
-        input: &[u8; BLOCK_INPUT_SIZE_IN_BYTES],
-        key: [u32; CHAINING_VALUE_LEN],
-    ) -> [u8; OUTPUT_SIZE_IN_BYTES] {
-        let mut h = key;
-
-        // Use input directly as message pointer (requires 4-byte alignment)
-        // This avoids the copy entirely on little-endian systems
-        #[cfg(target_endian = "little")]
-        {
-            unsafe {
-                blake3_keyed64_compress(h.as_mut_ptr(), input.as_ptr() as *const u32);
-            }
-        }
-
-        #[cfg(target_endian = "big")]
-        {
-            let mut message = [0u32; MSG_BLOCK_LEN];
-            for i in 0..MSG_BLOCK_LEN {
-                let offset = i * 4;
-                message[i] = u32::from_le_bytes([
-                    input[offset],
-                    input[offset + 1],
-                    input[offset + 2],
-                    input[offset + 3],
-                ]);
-            }
-            unsafe {
-                blake3_keyed64_compress(h.as_mut_ptr(), message.as_ptr());
-            }
-        }
-
-        to_bytes(h)
-    }
 }
 
 #[inline(always)]
@@ -255,7 +197,30 @@ fn to_bytes(h: [u32; CHAINING_VALUE_LEN]) -> [u8; OUTPUT_SIZE_IN_BYTES] {
 }
 
 /// Compress with direct copy to message array (no intermediate buffer).
-/// Optimized for virtual cycles by avoiding double-copy.
+/// Low-level BLAKE3 compress function with configurable flags.
+///
+/// This function performs a single BLAKE3 compression operation, suitable for:
+/// - Merkle tree internal nodes (with `PARENT` flag)
+/// - Merkle tree root (with `PARENT | ROOT` flags)
+/// - Leaf CV computation (with `CHUNK_START | CHUNK_END` flags)
+///
+/// # Arguments
+/// * `hash_state` - The chaining value (typically IV for fresh compression)
+/// * `input` - Input data (up to 64 bytes, will be zero-padded)
+/// * `counter` - Block counter (usually 0 for single-block operations)
+/// * `input_bytes_num` - Actual number of input bytes (for padding)
+/// * `flags` - BLAKE3 flags (CHUNK_START, CHUNK_END, PARENT, ROOT, KEYED_HASH, etc.)
+///
+/// # Example
+/// ```ignore
+/// use blake3_inline::{compress_direct, IV, CHAINING_VALUE_LEN};
+///
+/// const PARENT: u32 = 1 << 2;
+///
+/// let mut cv = IV;
+/// let input: [u8; 64] = /* left_cv || right_cv */;
+/// compress_direct(&mut cv, &input, 0, 64, PARENT);
+/// ```
 #[inline(always)]
 fn compress_direct(
     hash_state: &mut [u32; CHAINING_VALUE_LEN],
@@ -369,46 +334,54 @@ pub unsafe fn blake3_compress(chaining_value: *mut u32, message: *const u32) {
     );
 }
 
-/// BLAKE3 compression function - guest implementation.
+/// BLAKE3 Hash64 - guest implementation.
+/// Hashes exactly 64 bytes with fixed IV and flags = CHUNK_START | CHUNK_END | ROOT.
 ///
 /// # Safety
-/// - `chaining_value` must be a valid pointer to 32 bytes of readable and writable memory.
-/// - `message` must be a valid pointer to 64 bytes of readable memory.
-/// - Both pointers must be properly aligned for u32 access (4-byte alignment).
+/// - `left` must be a valid pointer to 32 bytes (first half).
+/// - `right` must be a valid pointer to 32 bytes (second half).
+/// - `output` must be a valid pointer to 32 bytes.
+/// - All pointers must be 8-byte aligned.
 #[cfg(not(feature = "host"))]
-pub unsafe fn blake3_keyed64_compress(chaining_value: *mut u32, message: *const u32) {
-    use crate::{BLAKE3_FUNCT3, BLAKE3_FUNCT7, BLAKE3_KEYED64_FUNCT3, INLINE_OPCODE};
-    // Memory layout for BLAKE3 instruction:
-    // rs1: points to chaining value (32 bytes)
-    // rs2: points to message block (64 bytes)
+pub unsafe fn blake3_hash64_compress(left: *const u8, right: *const u8, output: *mut u8) {
+    use crate::{BLAKE3_FUNCT7, BLAKE3_HASH64_FUNCT3, INLINE_OPCODE};
+
+    debug_assert!(left as usize % 8 == 0, "left must be 8-byte aligned");
+    debug_assert!(right as usize % 8 == 0, "right must be 8-byte aligned");
+    debug_assert!(output as usize % 8 == 0, "output must be 8-byte aligned");
 
     core::arch::asm!(
-        ".insn r {opcode}, {funct3}, {funct7}, x0, {rs1}, {rs2}",
+        ".insn r {opcode}, {funct3}, {funct7}, {rd}, {rs1}, {rs2}",
         opcode = const INLINE_OPCODE,
-        funct3 = const BLAKE3_KEYED64_FUNCT3,
+        funct3 = const BLAKE3_HASH64_FUNCT3,
         funct7 = const BLAKE3_FUNCT7,
-        rs1 = in(reg) chaining_value,
-        rs2 = in(reg) message,
+        rd = in(reg) output,
+        rs1 = in(reg) left,
+        rs2 = in(reg) right,
         options(nostack)
     );
 }
 
-/// BLAKE3 compression function - host implementation.
-///
-/// # Safety
-/// - `chaining_value` must be a valid pointer to 32 bytes.
-/// - `message` must be a valid pointer to 64 bytes.
+/// BLAKE3 Hash64 - host implementation.
 #[cfg(feature = "host")]
-pub unsafe fn blake3_keyed64_compress(chaining_value: *mut u32, message: *const u32) {
-    let message_block = &*(message as *const [u32; 16]);
+pub unsafe fn blake3_hash64_compress(left: *const u8, right: *const u8, output: *mut u8) {
+    debug_assert!(left as usize % 8 == 0, "left must be 8-byte aligned");
+    debug_assert!(right as usize % 8 == 0, "right must be 8-byte aligned");
+    debug_assert!(output as usize % 8 == 0, "output must be 8-byte aligned");
 
-    // On the host, we call our reference implementation from the exec module.
+    let mut message_block = [0u32; 16];
+    core::ptr::copy_nonoverlapping(left as *const u32, message_block.as_mut_ptr(), 8);
+    core::ptr::copy_nonoverlapping(right as *const u32, message_block.as_mut_ptr().add(8), 8);
+
+    let output_arr = &mut *(output as *mut [u32; 8]);
+    *output_arr = crate::IV;
+
     crate::exec::execute_blake3_compression(
-        &mut *(chaining_value as *mut [u32; 8]),
-        message_block,
+        output_arr,
+        &message_block,
         &[0, 0],
         64,
-        crate::FLAG_CHUNK_START | crate::FLAG_CHUNK_END | crate::FLAG_ROOT | crate::FLAG_KEYED_HASH,
+        crate::FLAG_CHUNK_START | crate::FLAG_CHUNK_END | crate::FLAG_ROOT,
     );
 }
 
@@ -451,92 +424,6 @@ mod tests {
             let result = Blake3::digest(&input);
             let expected = compute_expected_result(&input);
             assert_eq!(result, expected, "digest mismatch for input={input:02x?}");
-        }
-    }
-
-    #[test]
-    fn test_keyed_digest_random_keys_match_standard() {
-        for _ in 0..1000 {
-            let input = generate_random_bytes(64);
-            let key_bytes = generate_random_bytes(CHAINING_VALUE_LEN * 4);
-            let mut key = [0u32; CHAINING_VALUE_LEN];
-            key.copy_from_slice(&bytes_to_u32_vec(&key_bytes));
-            let result = Blake3::keyed_hash(&input, key);
-            let expected = compute_keyed_expected_result(&input, key);
-            assert_eq!(
-                result, expected,
-                "keyed digest mismatch for input={input:02x?} and random key={key:x?}",
-            );
-        }
-    }
-
-    #[test]
-    fn test_keyed_hash64_matches_keyed_hash() {
-        // Test that keyed_hash64 produces the same result as keyed_hash for 64-byte inputs
-        for _ in 0..1000 {
-            let input_vec = generate_random_bytes(64);
-            let mut input = [0u8; 64];
-            input.copy_from_slice(&input_vec);
-
-            let key_bytes = generate_random_bytes(CHAINING_VALUE_LEN * 4);
-            let mut key = [0u32; CHAINING_VALUE_LEN];
-            key.copy_from_slice(&bytes_to_u32_vec(&key_bytes));
-
-            let result_hash = Blake3::keyed_hash(&input, key);
-            let result_hash64 = Blake3::keyed_hash64(&input, key);
-
-            assert_eq!(
-                result_hash, result_hash64,
-                "keyed_hash vs keyed_hash64 mismatch for input={input:02x?}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_keyed_hash64_aligned_vs_unaligned() {
-        // Test with various keys
-        let test_keys: [[u32; 8]; 3] = [
-            [0u32; 8],       // all zeros
-            [0xFFFFFFFF; 8], // all ones
-            [
-                0x12345678, 0x9ABCDEF0, 0x11111111, 0x22222222, 0x33333333, 0x44444444, 0x55555555,
-                0x66666666,
-            ], // mixed
-        ];
-
-        for key in &test_keys {
-            // Create aligned input
-            let mut aligned = [0u8; 64];
-            for (i, b) in aligned.iter_mut().enumerate() {
-                *b = (i * 37 + 11) as u8;
-            }
-
-            // Create unaligned input (offset by 1 byte)
-            let mut unaligned_buf = [0u8; 65];
-            unaligned_buf[1..].copy_from_slice(&aligned);
-
-            // Verify alignment difference
-            assert_ne!(
-                aligned.as_ptr() as usize % 8,
-                unaligned_buf[1..].as_ptr() as usize % 8,
-                "Test setup error: should have different alignment"
-            );
-
-            // keyed_hash64 requires &[u8; 64], so we need to convert
-            let aligned_result = Blake3::keyed_hash64(&aligned, *key);
-
-            // For unaligned, use keyed_hash (which accepts &[u8])
-            let unaligned_result = Blake3::keyed_hash(&unaligned_buf[1..], *key);
-
-            // Both should match the reference
-            let expected = compute_keyed_expected_result(&aligned, *key);
-
-            assert_eq!(aligned_result, expected, "keyed_hash64 aligned mismatch");
-            assert_eq!(unaligned_result, expected, "keyed_hash unaligned mismatch");
-            assert_eq!(
-                aligned_result, unaligned_result,
-                "aligned vs unaligned mismatch"
-            );
         }
     }
 
@@ -629,5 +516,54 @@ mod tests {
                 "Blake3: result doesn't match reference at size {size}"
             );
         }
+    }
+
+    #[test]
+    fn test_hash64_compress_consistency() {
+        // Test that hash64_compress produces consistent results
+        let left = [1u8; 32];
+        let right = [2u8; 32];
+
+        let mut output1 = [0u8; 32];
+        let mut output2 = [0u8; 32];
+
+        unsafe {
+            super::blake3_hash64_compress(left.as_ptr(), right.as_ptr(), output1.as_mut_ptr());
+            super::blake3_hash64_compress(left.as_ptr(), right.as_ptr(), output2.as_mut_ptr());
+        }
+
+        assert_eq!(output1, output2, "hash64_compress should be deterministic");
+        assert_ne!(
+            output1, [0u8; 32],
+            "hash64_compress should produce non-zero output"
+        );
+    }
+
+    #[test]
+    fn test_hash64_matches_digest() {
+        // hash64_compress with flags = CHUNK_START | CHUNK_END | ROOT should match digest
+        let mut input = [0u8; 64];
+        for (i, b) in input.iter_mut().enumerate() {
+            *b = (i * 3 + 7) as u8;
+        }
+
+        let left = &input[..32];
+        let right = &input[32..];
+
+        let mut hash64_output = [0u8; 32];
+        unsafe {
+            super::blake3_hash64_compress(
+                left.as_ptr(),
+                right.as_ptr(),
+                hash64_output.as_mut_ptr(),
+            );
+        }
+
+        let digest_output = super::Blake3::digest(&input);
+
+        assert_eq!(
+            hash64_output, digest_output,
+            "hash64_compress should produce same result as digest for 64B input"
+        );
     }
 }

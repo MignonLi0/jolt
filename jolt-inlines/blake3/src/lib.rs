@@ -4,10 +4,10 @@
 pub const INLINE_OPCODE: u32 = 0x0B;
 
 pub const BLAKE3_FUNCT3: u32 = 0x00;
-pub const BLAKE3_KEYED64_FUNCT3: u32 = 0x01;
+pub const BLAKE3_HASH64_FUNCT3: u32 = 0x02; // Hash 64B with fixed IV (CHUNK_START | CHUNK_END | ROOT)
 pub const BLAKE3_FUNCT7: u32 = 0x03;
 pub const BLAKE3_NAME: &str = "BLAKE3_INLINE";
-pub const BLAKE3_KEYED64_NAME: &str = "BLAKE3_KEYED64_INLINE";
+pub const BLAKE3_HASH64_NAME: &str = "BLAKE3_HASH64_INLINE";
 
 pub mod sdk;
 pub use sdk::*;
@@ -56,4 +56,4 @@ pub const WORD_SIZE: usize = 32;
 pub const FLAG_CHUNK_START: u32 = 1;
 pub const FLAG_CHUNK_END: u32 = 2;
 pub const FLAG_ROOT: u32 = 8;
-pub const FLAG_KEYED_HASH: u32 = 16;
+pub const FLAG_KEYED_HASH: u32 = 16; // Used in tests for generic compress
