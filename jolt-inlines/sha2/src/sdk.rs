@@ -220,17 +220,11 @@ impl Sha256 {
             self.buffer[12].write(0);
             self.buffer[13].write(0);
 
-            // Write length in last 8 bytes
-            #[cfg(target_endian = "little")]
-            {
-                self.buffer[14].write(swap_bytes((bit_len >> 32) as u32));
-                self.buffer[15].write(swap_bytes(bit_len as u32));
-            }
-            #[cfg(target_endian = "big")]
-            {
-                self.buffer[14].write((bit_len >> 32) as u32);
-                self.buffer[15].write(bit_len as u32);
-            }
+            // Write length in last 8 bytes (big-endian u32 values)
+            // Note: No swap needed here because the second block buffer
+            // is NOT passed through swap_bytes before compression
+            self.buffer[14].write((bit_len >> 32) as u32);
+            self.buffer[15].write(bit_len as u32);
 
             unsafe {
                 sha256_compression(

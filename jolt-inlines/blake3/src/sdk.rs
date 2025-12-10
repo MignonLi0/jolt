@@ -1,7 +1,7 @@
 //! This file provides high-level API to use BLAKE3 compression, both in host and guest mode.
 use crate::{
     BLOCK_INPUT_SIZE_IN_BYTES, CHAINING_VALUE_LEN, COUNTER_LEN, FLAG_CHUNK_END, FLAG_CHUNK_START,
-    FLAG_ROOT, IV, MSG_BLOCK_LEN, OUTPUT_SIZE_IN_BYTES,
+    FLAG_KEYED_HASH, FLAG_ROOT, IV, MSG_BLOCK_LEN, OUTPUT_SIZE_IN_BYTES,
 };
 
 pub struct Blake3 {
@@ -14,9 +14,6 @@ pub struct Blake3 {
     /// Total bytes processed
     counter: u64,
 }
-
-#[repr(align(4))]
-pub struct Aligned64ByteInput(pub [u8; BLOCK_INPUT_SIZE_IN_BYTES]);
 
 /// Note: Current implementation only supports hashing input of at most 64 bytes. Larger inputs are not supported yet.
 impl Blake3 {
@@ -109,38 +106,82 @@ impl Blake3 {
         }
     }
 
+    /// Computes BLAKE3 hash in one call (max 64 bytes input).
+    /// Optimized for virtual cycles by avoiding intermediate buffer.
     #[inline(always)]
     pub fn digest(input: &[u8]) -> [u8; OUTPUT_SIZE_IN_BYTES] {
-        let mut hasher = Self::new();
-        hasher.update(input);
-        hasher.finalize()
+        let len = input.len();
+        if len > BLOCK_INPUT_SIZE_IN_BYTES {
+            panic!("Input too large: {len} bytes, max is {BLOCK_INPUT_SIZE_IN_BYTES}");
+        }
+
+        let mut h = IV;
+        compress_direct(
+            &mut h,
+            input,
+            0,
+            len as u32,
+            FLAG_CHUNK_START | FLAG_CHUNK_END | FLAG_ROOT,
+        );
+        to_bytes(h)
     }
 
-    /// Computes a keyed BLAKE3 hash for given input and key.
-    ///
-    /// Note: This only works for 64-byte inputs
+    /// Computes a keyed BLAKE3 hash (max 64 bytes input).
+    /// Optimized for virtual cycles by avoiding intermediate buffer.
     #[inline(always)]
-    pub fn keyed_hash(
-        input: &Aligned64ByteInput,
+    pub fn keyed_hash(input: &[u8], key: [u32; CHAINING_VALUE_LEN]) -> [u8; OUTPUT_SIZE_IN_BYTES] {
+        let len = input.len();
+        if len > BLOCK_INPUT_SIZE_IN_BYTES {
+            panic!("Input too large: {len} bytes, max is {BLOCK_INPUT_SIZE_IN_BYTES}");
+        }
+
+        let mut h = key;
+        compress_direct(
+            &mut h,
+            input,
+            0,
+            len as u32,
+            FLAG_CHUNK_START | FLAG_CHUNK_END | FLAG_ROOT | FLAG_KEYED_HASH,
+        );
+        to_bytes(h)
+    }
+
+    /// Computes a keyed BLAKE3 hash for exactly 64 bytes input.
+    /// Uses specialized instruction that embeds counter/flags as constants.
+    #[inline(always)]
+    pub fn keyed_hash64(
+        input: &[u8; BLOCK_INPUT_SIZE_IN_BYTES],
         key: [u32; CHAINING_VALUE_LEN],
     ) -> [u8; OUTPUT_SIZE_IN_BYTES] {
         let mut h = key;
 
+        // Use input directly as message pointer (requires 4-byte alignment)
+        // This avoids the copy entirely on little-endian systems
+        #[cfg(target_endian = "little")]
+        {
+            unsafe {
+                blake3_keyed64_compress(h.as_mut_ptr(), input.as_ptr() as *const u32);
+            }
+        }
+
         #[cfg(target_endian = "big")]
         {
-            unimplemented!()
+            let mut message = [0u32; MSG_BLOCK_LEN];
+            for i in 0..MSG_BLOCK_LEN {
+                let offset = i * 4;
+                message[i] = u32::from_le_bytes([
+                    input[offset],
+                    input[offset + 1],
+                    input[offset + 2],
+                    input[offset + 3],
+                ]);
+            }
+            unsafe {
+                blake3_keyed64_compress(h.as_mut_ptr(), message.as_ptr());
+            }
         }
 
-        // Cast is safe as [u8; 64] and [u32; 16] have same size/alignment.
-        let message = unsafe { &*(input.0.as_ptr() as *const [u32; 16]) };
-
-        // Both h and message are properly aligned and sized.
-        unsafe {
-            blake3_keyed64_compress(h.as_mut_ptr(), message.as_ptr());
-        }
-
-        // [u32; 8] and [u8; 32] have identical memory layout on little-endian.
-        unsafe { core::mem::transmute::<[u32; CHAINING_VALUE_LEN], [u8; OUTPUT_SIZE_IN_BYTES]>(h) }
+        to_bytes(h)
     }
 }
 
@@ -157,7 +198,6 @@ fn compression_caller(
 
     #[cfg(target_endian = "little")]
     unsafe {
-        // Direct memory copy on little-endian
         core::ptr::copy_nonoverlapping(
             message_block.as_ptr() as *const u32,
             message.as_mut_ptr(),
@@ -192,6 +232,81 @@ fn compression_caller(
 impl Default for Blake3 {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Convert hash state to output bytes.
+#[inline(always)]
+fn to_bytes(h: [u32; CHAINING_VALUE_LEN]) -> [u8; OUTPUT_SIZE_IN_BYTES] {
+    #[cfg(target_endian = "little")]
+    {
+        unsafe { core::mem::transmute(h) }
+    }
+
+    #[cfg(target_endian = "big")]
+    {
+        let mut hash = [0u8; OUTPUT_SIZE_IN_BYTES];
+        for i in 0..CHAINING_VALUE_LEN {
+            let bytes = h[i].to_le_bytes();
+            hash[i * 4..(i + 1) * 4].copy_from_slice(&bytes);
+        }
+        hash
+    }
+}
+
+/// Compress with direct copy to message array (no intermediate buffer).
+/// Optimized for virtual cycles by avoiding double-copy.
+#[inline(always)]
+fn compress_direct(
+    hash_state: &mut [u32; CHAINING_VALUE_LEN],
+    input: &[u8],
+    counter: u64,
+    input_bytes_num: u32,
+    flags: u32,
+) {
+    let mut message = [0u32; MSG_BLOCK_LEN + COUNTER_LEN + 2];
+    let len = input.len();
+
+    #[cfg(target_endian = "little")]
+    if len > 0 {
+        unsafe {
+            // Copy input directly to message (padded with zeros)
+            core::ptr::copy_nonoverlapping(input.as_ptr(), message.as_mut_ptr() as *mut u8, len);
+        }
+    }
+
+    #[cfg(target_endian = "big")]
+    {
+        let full_words = len / 4;
+        let remaining = len % 4;
+
+        for i in 0..full_words {
+            let offset = i * 4;
+            message[i] = u32::from_le_bytes([
+                input[offset],
+                input[offset + 1],
+                input[offset + 2],
+                input[offset + 3],
+            ]);
+        }
+
+        if remaining > 0 {
+            let mut bytes = [0u8; 4];
+            let offset = full_words * 4;
+            for j in 0..remaining {
+                bytes[j] = input[offset + j];
+            }
+            message[full_words] = u32::from_le_bytes(bytes);
+        }
+    }
+
+    message[MSG_BLOCK_LEN] = counter as u32;
+    message[MSG_BLOCK_LEN + 1] = (counter >> 32) as u32;
+    message[MSG_BLOCK_LEN + COUNTER_LEN] = input_bytes_num;
+    message[MSG_BLOCK_LEN + COUNTER_LEN + 1] = flags;
+
+    unsafe {
+        blake3_compress(hash_state.as_mut_ptr(), message.as_ptr());
     }
 }
 
@@ -342,16 +457,85 @@ mod tests {
     #[test]
     fn test_keyed_digest_random_keys_match_standard() {
         for _ in 0..1000 {
-            let input = super::Aligned64ByteInput(generate_random_bytes(64).try_into().unwrap());
+            let input = generate_random_bytes(64);
             let key_bytes = generate_random_bytes(CHAINING_VALUE_LEN * 4);
             let mut key = [0u32; CHAINING_VALUE_LEN];
             key.copy_from_slice(&bytes_to_u32_vec(&key_bytes));
             let result = Blake3::keyed_hash(&input, key);
-            let expected = compute_keyed_expected_result(&input.0, key);
+            let expected = compute_keyed_expected_result(&input, key);
             assert_eq!(
                 result, expected,
-                "keyed digest mismatch for input={:02x?} and random key={key:x?}",
-                input.0
+                "keyed digest mismatch for input={input:02x?} and random key={key:x?}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_keyed_hash64_matches_keyed_hash() {
+        // Test that keyed_hash64 produces the same result as keyed_hash for 64-byte inputs
+        for _ in 0..1000 {
+            let input_vec = generate_random_bytes(64);
+            let mut input = [0u8; 64];
+            input.copy_from_slice(&input_vec);
+
+            let key_bytes = generate_random_bytes(CHAINING_VALUE_LEN * 4);
+            let mut key = [0u32; CHAINING_VALUE_LEN];
+            key.copy_from_slice(&bytes_to_u32_vec(&key_bytes));
+
+            let result_hash = Blake3::keyed_hash(&input, key);
+            let result_hash64 = Blake3::keyed_hash64(&input, key);
+
+            assert_eq!(
+                result_hash, result_hash64,
+                "keyed_hash vs keyed_hash64 mismatch for input={input:02x?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_keyed_hash64_aligned_vs_unaligned() {
+        // Test with various keys
+        let test_keys: [[u32; 8]; 3] = [
+            [0u32; 8],       // all zeros
+            [0xFFFFFFFF; 8], // all ones
+            [
+                0x12345678, 0x9ABCDEF0, 0x11111111, 0x22222222, 0x33333333, 0x44444444, 0x55555555,
+                0x66666666,
+            ], // mixed
+        ];
+
+        for key in &test_keys {
+            // Create aligned input
+            let mut aligned = [0u8; 64];
+            for (i, b) in aligned.iter_mut().enumerate() {
+                *b = (i * 37 + 11) as u8;
+            }
+
+            // Create unaligned input (offset by 1 byte)
+            let mut unaligned_buf = [0u8; 65];
+            unaligned_buf[1..].copy_from_slice(&aligned);
+
+            // Verify alignment difference
+            assert_ne!(
+                aligned.as_ptr() as usize % 8,
+                unaligned_buf[1..].as_ptr() as usize % 8,
+                "Test setup error: should have different alignment"
+            );
+
+            // keyed_hash64 requires &[u8; 64], so we need to convert
+            let aligned_result = Blake3::keyed_hash64(&aligned, *key);
+
+            // For unaligned, use keyed_hash (which accepts &[u8])
+            let unaligned_result = Blake3::keyed_hash(&unaligned_buf[1..], *key);
+
+            // Both should match the reference
+            let expected = compute_keyed_expected_result(&aligned, *key);
+
+            assert_eq!(aligned_result, expected, "keyed_hash64 aligned mismatch");
+            assert_eq!(unaligned_result, expected, "keyed_hash unaligned mismatch");
+            assert_eq!(
+                aligned_result, unaligned_result,
+                "aligned vs unaligned mismatch"
             );
         }
     }
@@ -404,5 +588,46 @@ mod tests {
         // All 0xFF (64 bytes)
         let maxes = [0xFFu8; 64];
         assert_eq!(Blake3::digest(&maxes), compute_expected_result(&maxes));
+    }
+
+    #[test]
+    fn test_blake3_aligned_vs_unaligned() {
+        // Test various sizes up to 64 bytes (Blake3 block size limit)
+        let test_sizes = [0, 1, 3, 4, 7, 8, 15, 16, 31, 32, 33, 63, 64];
+
+        for &size in &test_sizes {
+            // Create aligned buffer
+            let aligned: Vec<u8> = (0..size).map(|i| (i * 37 + 11) as u8).collect();
+
+            // Create unaligned buffer by adding 1-byte offset
+            let mut unaligned_buf = vec![0u8; size + 1];
+            unaligned_buf[1..].copy_from_slice(&aligned);
+            let unaligned = &unaligned_buf[1..];
+
+            // Verify alignment difference
+            if size > 0 {
+                assert_ne!(
+                    aligned.as_ptr() as usize % 4,
+                    unaligned.as_ptr() as usize % 4,
+                    "Test setup error: pointers should have different alignment"
+                );
+            }
+
+            // Both should produce identical results
+            let aligned_result = Blake3::digest(&aligned);
+            let unaligned_result = Blake3::digest(unaligned);
+
+            assert_eq!(
+                aligned_result, unaligned_result,
+                "Blake3: aligned vs unaligned mismatch at size {size}"
+            );
+
+            // Also verify against reference implementation
+            let expected = compute_expected_result(&aligned);
+            assert_eq!(
+                aligned_result, expected,
+                "Blake3: result doesn't match reference at size {size}"
+            );
+        }
     }
 }
