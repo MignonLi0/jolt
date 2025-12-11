@@ -1,8 +1,70 @@
 //! This file provides high-level API to use BLAKE3 compression, both in host and guest mode.
 use crate::{
     BLOCK_INPUT_SIZE_IN_BYTES, CHAINING_VALUE_LEN, COUNTER_LEN, FLAG_CHUNK_END, FLAG_CHUNK_START,
-    FLAG_ROOT, IV, MSG_BLOCK_LEN, OUTPUT_SIZE_IN_BYTES,
+    FLAG_KEYED_HASH, FLAG_ROOT, IV, MSG_BLOCK_LEN, OUTPUT_SIZE_IN_BYTES,
 };
+
+/// 8-byte aligned 32-byte hash/key type for BLAKE3 operations.
+///
+/// This type ensures proper alignment for efficient 64-bit load/store operations
+/// in the RISC-V instruction sequence.
+#[repr(align(8))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct AlignedHash32(pub [u8; 32]);
+
+impl AlignedHash32 {
+    /// Create a new AlignedHash32 from a byte array
+    #[inline(always)]
+    pub const fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Create a zeroed AlignedHash32
+    #[inline(always)]
+    pub const fn zeroed() -> Self {
+        Self([0u8; 32])
+    }
+
+    /// Get a reference to the inner bytes
+    #[inline(always)]
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Get a mutable reference to the inner bytes
+    #[inline(always)]
+    pub fn as_bytes_mut(&mut self) -> &mut [u8; 32] {
+        &mut self.0
+    }
+}
+
+impl From<[u8; 32]> for AlignedHash32 {
+    #[inline(always)]
+    fn from(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl From<AlignedHash32> for [u8; 32] {
+    #[inline(always)]
+    fn from(hash: AlignedHash32) -> Self {
+        hash.0
+    }
+}
+
+impl AsRef<[u8; 32]> for AlignedHash32 {
+    #[inline(always)]
+    fn as_ref(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl AsMut<[u8; 32]> for AlignedHash32 {
+    #[inline(always)]
+    fn as_mut(&mut self) -> &mut [u8; 32] {
+        &mut self.0
+    }
+}
 
 pub struct Blake3 {
     /// Hash state (8 x 32-bit words)
@@ -179,7 +241,7 @@ impl Default for Blake3 {
 
 /// Convert hash state to output bytes.
 #[inline(always)]
-fn to_bytes(h: [u32; CHAINING_VALUE_LEN]) -> [u8; OUTPUT_SIZE_IN_BYTES] {
+pub(crate) fn to_bytes(h: [u32; CHAINING_VALUE_LEN]) -> [u8; OUTPUT_SIZE_IN_BYTES] {
     #[cfg(target_endian = "little")]
     {
         unsafe { core::mem::transmute(h) }
@@ -222,7 +284,7 @@ fn to_bytes(h: [u32; CHAINING_VALUE_LEN]) -> [u8; OUTPUT_SIZE_IN_BYTES] {
 /// compress_direct(&mut cv, &input, 0, 64, PARENT);
 /// ```
 #[inline(always)]
-fn compress_direct(
+pub(crate) fn compress_direct(
     hash_state: &mut [u32; CHAINING_VALUE_LEN],
     input: &[u8],
     counter: u64,
@@ -335,60 +397,88 @@ pub unsafe fn blake3_compress(chaining_value: *mut u32, message: *const u32) {
 }
 
 /// BLAKE3 Keyed64 - guest implementation (internal).
+/// Hash two child CVs for Merkle tree.
+/// ABI: rs1 = left, rs2 = right, rd = iv (in/out)
 #[cfg(not(feature = "host"))]
 #[inline(always)]
-unsafe fn blake3_keyed64_compress(key: *mut u32, message: *const u32) {
+unsafe fn blake3_keyed64_compress(left: *const u32, right: *const u32, iv: *mut u32) {
     use crate::{BLAKE3_FUNCT7, BLAKE3_KEYED64_FUNCT3, INLINE_OPCODE};
 
     core::arch::asm!(
-        ".insn r {opcode}, {funct3}, {funct7}, x0, {rs1}, {rs2}",
+        ".insn r {opcode}, {funct3}, {funct7}, {rd}, {rs1}, {rs2}",
         opcode = const INLINE_OPCODE,
         funct3 = const BLAKE3_KEYED64_FUNCT3,
         funct7 = const BLAKE3_FUNCT7,
-        rs1 = in(reg) key,
-        rs2 = in(reg) message,
+        rd = in(reg) iv,
+        rs1 = in(reg) left,
+        rs2 = in(reg) right,
         options(nostack)
     );
 }
 
 /// BLAKE3 Keyed64 - host implementation (internal).
+/// Matches blake3::keyed_hash for 64-byte input.
 #[cfg(feature = "host")]
 #[inline(always)]
-unsafe fn blake3_keyed64_compress(key: *mut u32, message: *const u32) {
-    let message_block = &*(message as *const [u32; 16]);
+unsafe fn blake3_keyed64_compress(left: *const u32, right: *const u32, key: *mut u32) {
+    // Concatenate left || right as message
+    let mut message = [0u32; 16];
+    core::ptr::copy_nonoverlapping(left, message.as_mut_ptr(), 8);
+    core::ptr::copy_nonoverlapping(right, message.as_mut_ptr().add(8), 8);
+
     let key_arr = &mut *(key as *mut [u32; 8]);
 
+    // flags = CHUNK_START | CHUNK_END | ROOT | KEYED_HASH
     crate::exec::execute_blake3_compression(
         key_arr,
-        message_block,
+        &message,
         &[0, 0],
         64,
-        crate::FLAG_CHUNK_START | crate::FLAG_CHUNK_END | crate::FLAG_ROOT | crate::FLAG_KEYED_HASH,
+        FLAG_CHUNK_START | FLAG_CHUNK_END | FLAG_ROOT | FLAG_KEYED_HASH,
     );
 }
 
-/// BLAKE3 keyed hash for exactly 64 bytes input (in-place, zero-copy).
+/// BLAKE3 keyed_hash for 64-byte input: `blake3::keyed_hash(key, left || right)`
 ///
-/// This is the most efficient high-level API. The key is modified in-place
-/// to contain the hash output.
+/// This is equivalent to calling `blake3::keyed_hash(&key, &[left, right].concat())`
+/// but optimized for when left and right are in separate memory locations.
+/// The key is modified in-place to contain the hash output.
 ///
 /// # Arguments
-/// * `key` - 32-byte key (8-byte aligned), will be overwritten with hash output
-/// * `input` - Exactly 64 bytes of input data (8-byte aligned)
+/// * `left` - 32-byte left half of input (8-byte aligned via AlignedHash32)
+/// * `right` - 32-byte right half of input (8-byte aligned via AlignedHash32)
+/// * `key` - 32-byte key (8-byte aligned via AlignedHash32), will be overwritten with hash output
 ///
 /// # Example
 /// ```ignore
-/// let mut key = [0u8; 32];
-/// let input = [0u8; 64];
-/// blake3_keyed64(&mut key, &input);
-/// // key now contains the 32-byte hash
+/// let left = AlignedHash32::new([0xAA; 32]);
+/// let right = AlignedHash32::new([0xBB; 32]);
+/// let mut key = AlignedHash32::new([...]); // your 32-byte key
+/// blake3_keyed64(&left, &right, &mut key);
+/// // key now contains blake3::keyed_hash(&original_key, &[left, right].concat())
 /// ```
 #[inline(always)]
-pub fn blake3_keyed64(key: &mut [u8; 32], input: &[u8; 64]) {
+pub fn blake3_keyed64(left: &AlignedHash32, right: &AlignedHash32, key: &mut AlignedHash32) {
     unsafe {
-        blake3_keyed64_compress(key.as_mut_ptr() as *mut u32, input.as_ptr() as *const u32);
+        blake3_keyed64_compress(
+            left.0.as_ptr() as *const u32,
+            right.0.as_ptr() as *const u32,
+            key.0.as_mut_ptr() as *mut u32,
+        );
     }
 }
+
+/// Standard BLAKE3 IV as AlignedHash32 (for use with blake3_keyed64)
+pub const BLAKE3_IV: AlignedHash32 = AlignedHash32([
+    0x67, 0xe6, 0x09, 0x6a, // 0x6a09e667 (little-endian)
+    0x85, 0xae, 0x67, 0xbb, // 0xbb67ae85
+    0x72, 0xf3, 0x6e, 0x3c, // 0x3c6ef372
+    0x3a, 0xf5, 0x4f, 0xa5, // 0xa54ff53a
+    0x7f, 0x52, 0x0e, 0x51, // 0x510e527f
+    0x8c, 0x68, 0x05, 0x9b, // 0x9b05688c
+    0xab, 0xd9, 0x83, 0x1f, // 0x1f83d9ab
+    0x19, 0xcd, 0xe0, 0x5b, // 0x5be0cd19
+]);
 
 #[cfg(test)]
 #[cfg(feature = "host")]
@@ -524,56 +614,76 @@ mod tests {
     }
 
     #[test]
-    fn test_blake3_keyed64_api() {
-        // Test the high-level blake3_keyed64 API (in-place)
+    fn test_blake3_keyed64_matches_reference() {
+        // Test that blake3_keyed64 matches the official blake3::keyed_hash for 64-byte input
+        use super::AlignedHash32;
         use rand::rngs::StdRng;
         use rand::{RngCore, SeedableRng};
 
-        let mut rng = StdRng::seed_from_u64(99999);
+        let mut rng = StdRng::seed_from_u64(77777);
 
         for _ in 0..100 {
-            let mut key = [0u8; 32];
+            let mut left = AlignedHash32::zeroed();
+            let mut right = AlignedHash32::zeroed();
+            let mut key = AlignedHash32::zeroed();
+            rng.fill_bytes(&mut left.0);
+            rng.fill_bytes(&mut right.0);
+            rng.fill_bytes(&mut key.0);
+
+            // Concatenate left || right as 64-byte input
             let mut input = [0u8; 64];
-            rng.fill_bytes(&mut key);
-            rng.fill_bytes(&mut input);
+            input[..32].copy_from_slice(&left.0);
+            input[32..].copy_from_slice(&right.0);
 
-            // Compare with standard blake3::keyed_hash (before modifying key)
-            let expected = blake3::keyed_hash(&key, &input);
-            let expected_bytes: [u8; 32] = expected.as_bytes()[..32].try_into().unwrap();
+            // Call official blake3::keyed_hash
+            let expected = blake3::keyed_hash(&key.0, &input);
 
-            // Use our high-level API (modifies key in-place)
-            super::blake3_keyed64(&mut key, &input);
+            // Call our keyed64 function (key is passed as iv, modified in-place)
+            let mut result_iv = key;
+            super::blake3_keyed64(&left, &right, &mut result_iv);
 
-            assert_eq!(key, expected_bytes, "blake3_keyed64 mismatch");
+            assert_eq!(
+                result_iv.0,
+                *expected.as_bytes(),
+                "blake3_keyed64 does not match blake3::keyed_hash"
+            );
         }
     }
 
     #[test]
     fn test_blake3_keyed64_deterministic() {
-        let input = [0xABu8; 64];
+        use super::AlignedHash32;
 
-        let mut key1 = [0x42u8; 32];
-        let mut key2 = [0x42u8; 32];
+        let left = AlignedHash32::new([0xAAu8; 32]);
+        let right = AlignedHash32::new([0xBBu8; 32]);
 
-        super::blake3_keyed64(&mut key1, &input);
-        super::blake3_keyed64(&mut key2, &input);
+        let mut iv1 = super::BLAKE3_IV;
+        let mut iv2 = super::BLAKE3_IV;
 
-        assert_eq!(key1, key2, "blake3_keyed64 should be deterministic");
+        super::blake3_keyed64(&left, &right, &mut iv1);
+        super::blake3_keyed64(&left, &right, &mut iv2);
+
+        assert_eq!(iv1, iv2, "blake3_keyed64 should be deterministic");
     }
 
     #[test]
-    fn test_blake3_keyed64_different_keys() {
-        let input = [0xFFu8; 64];
+    fn test_blake3_keyed64_different_inputs() {
+        use super::AlignedHash32;
 
-        let mut key1 = [0x11u8; 32];
-        let mut key2 = [0x22u8; 32];
+        let left1 = AlignedHash32::new([0x11u8; 32]);
+        let right1 = AlignedHash32::new([0x22u8; 32]);
+        let left2 = AlignedHash32::new([0x33u8; 32]);
+        let right2 = AlignedHash32::new([0x44u8; 32]);
 
-        super::blake3_keyed64(&mut key1, &input);
-        super::blake3_keyed64(&mut key2, &input);
+        let mut iv1 = super::BLAKE3_IV;
+        let mut iv2 = super::BLAKE3_IV;
+
+        super::blake3_keyed64(&left1, &right1, &mut iv1);
+        super::blake3_keyed64(&left2, &right2, &mut iv2);
 
         assert_ne!(
-            key1, key2,
-            "Different keys should produce different results"
+            iv1, iv2,
+            "Different inputs should produce different results"
         );
     }
 }

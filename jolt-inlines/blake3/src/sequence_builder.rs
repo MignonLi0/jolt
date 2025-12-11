@@ -59,7 +59,7 @@ struct Blake3SequenceBuilder {
 #[derive(Clone, Copy)]
 enum BuildMode {
     Compression,
-    Keyed64, // Keyed 64B hash: key from rs1, flags = CHUNK_START | CHUNK_END | ROOT | KEYED_HASH
+    Keyed64, // Keyed64: left from rs1, right from rs2, IV from rd, output to rd
 }
 
 impl Blake3SequenceBuilder {
@@ -85,10 +85,12 @@ impl Blake3SequenceBuilder {
                 self.load_input_len_and_flags();
             }
             BuildMode::Keyed64 => {
-                // Load chaining value (key) from rs1
-                self.load_chaining_value();
-                // Load message from rs2
-                self.load_message_blocks();
+                // Load IV from rs3/rd (will also be output destination)
+                self.load_chaining_value_from_rs3();
+                // Load left (32 bytes) from rs1 as message[0..7]
+                self.load_left_from_rs1();
+                // Load right (32 bytes) from rs2 as message[8..15]
+                self.load_right_from_rs2();
             }
         }
 
@@ -102,8 +104,11 @@ impl Blake3SequenceBuilder {
         // Finalize: h[i] = v[i] ^ v[i+8]
         self.finalize_state();
 
-        // Store state to rs1 for all modes
-        self.store_state();
+        // Store state
+        match build_mode {
+            BuildMode::Keyed64 => self.store_state_to_rs3(),
+            _ => self.store_state(),
+        }
 
         drop(self.vr);
         self.asm.finalize_inline()
@@ -151,7 +156,8 @@ impl Blake3SequenceBuilder {
                 );
             }
             BuildMode::Keyed64 => {
-                // Keyed 64B: flags = CHUNK_START | CHUNK_END | ROOT | KEYED_HASH = 0x1B
+                // Keyed64: matches blake3::keyed_hash for 64-byte input
+                // counter = 0, block_len = 64, flags = CHUNK_START|CHUNK_END|ROOT|KEYED_HASH
                 self.asm
                     .emit_u::<LUI>(*self.vr[INTERNAL_STATE_VR_START + 12], 0);
                 self.asm
@@ -241,6 +247,18 @@ impl Blake3SequenceBuilder {
         }
     }
 
+    /// Store state to rs3/rd (for Merge mode)
+    fn store_state_to_rs3(&mut self) {
+        for i in 0..CHAINING_VALUE_LEN / 2 {
+            self.store_paired_u32(
+                self.operands.rs3,
+                (i * 2) as i64 * 4,
+                *self.vr[CV_START_VR + i * 2],
+                *self.vr[CV_START_VR + i * 2 + 1],
+            );
+        }
+    }
+
     /// Load two u32 values from an 8-byte aligned address using a single LD
     /// This is more efficient than two separate LW instructions in 64-bit mode
     fn load_paired_u32(&mut self, base: u8, offset: i64, vr_lo: u8, vr_hi: u8) {
@@ -317,9 +335,24 @@ impl Blake3SequenceBuilder {
         self.load_data_range_paired(self.operands.rs1, 0, CV_START_VR, CHAINING_VALUE_LEN);
     }
 
+    fn load_chaining_value_from_rs3(&mut self) {
+        // Load chaining value from rs3/rd (for Merge mode)
+        self.load_data_range_paired(self.operands.rs3, 0, CV_START_VR, CHAINING_VALUE_LEN);
+    }
+
     fn load_message_blocks(&mut self) {
         // Use paired loading for message blocks (16 u32 = 8 pairs)
         self.load_data_range_paired(self.operands.rs2, 0, MSG_BLOCK_START_VR, MSG_BLOCK_LEN);
+    }
+
+    fn load_left_from_rs1(&mut self) {
+        // Load left (32 bytes = 8 u32) from rs1 as message[0..7]
+        self.load_data_range_paired(self.operands.rs1, 0, MSG_BLOCK_START_VR, 8);
+    }
+
+    fn load_right_from_rs2(&mut self) {
+        // Load right (32 bytes = 8 u32) from rs2 as message[8..15]
+        self.load_data_range_paired(self.operands.rs2, 0, MSG_BLOCK_START_VR + 8, 8);
     }
 
     fn load_counter(&mut self) {
@@ -355,11 +388,12 @@ pub fn blake3_inline_sequence_builder(
     builder.build(BuildMode::Compression)
 }
 
-/// Build sequence for Keyed64 (64B keyed hash):
-/// - Key/IV loaded from rs1 (32B)
-/// - Message loaded from rs2 (64B)
-/// - flags = CHUNK_START | CHUNK_END | ROOT | KEYED_HASH (0x1B)
-/// - Output overwrites rs1
+/// Build sequence for Keyed64 (Merkle tree parent hash):
+/// - Left child CV from rs1 (32B)
+/// - Right child CV from rs2 (32B)
+/// - IV loaded from rd (32B), also used as output
+/// - flags = PARENT (0x04)
+/// - Output overwrites rd
 pub fn blake3_keyed64_inline_sequence_builder(
     asm: InstrAssembler,
     operands: FormatInline,
@@ -371,7 +405,8 @@ pub fn blake3_keyed64_inline_sequence_builder(
 #[cfg(test)]
 mod tests {
     use crate::test_utils::{
-        create_blake3_harness, helpers::*, instruction, load_blake3_data, read_output,
+        create_blake3_harness, create_blake3_keyed64_harness, helpers::*, instruction,
+        keyed64_instruction, load_blake3_data, load_blake3_keyed64_data, read_output,
         ChainingValue, MessageBlock,
     };
 
@@ -460,6 +495,68 @@ mod tests {
             assert_eq!(
                 trace_hash_bytes, expected_hash_bytes,
                 "keyed trace hash bytes mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn test_trace_keyed64_matches_blake3_keyed_hash() {
+        // Test that sequence builder's Keyed64 mode matches blake3::keyed_hash for 64-byte input
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let mut rng = StdRng::seed_from_u64(88888);
+
+        for _ in 0..100 {
+            // Generate random left, right, and key
+            let mut left = [0u32; crate::CHAINING_VALUE_LEN];
+            let mut right = [0u32; crate::CHAINING_VALUE_LEN];
+            let mut key = [0u32; crate::CHAINING_VALUE_LEN];
+            for i in 0..crate::CHAINING_VALUE_LEN {
+                left[i] = rng.gen();
+                right[i] = rng.gen();
+                key[i] = rng.gen();
+            }
+
+            // Execute sequence builder with key as IV
+            let mut harness = create_blake3_keyed64_harness();
+            load_blake3_keyed64_data(&mut harness, &left, &right, &key);
+            harness.execute_inline(keyed64_instruction());
+            let result_words = read_output(&mut harness);
+
+            // Convert result to bytes
+            let mut result_bytes = [0u8; 32];
+            for (i, w) in result_words.iter().enumerate() {
+                let le = w.to_le_bytes();
+                result_bytes[i * 4..(i + 1) * 4].copy_from_slice(&le);
+            }
+
+            // Convert left/right/key to bytes for blake3 reference
+            let mut left_bytes = [0u8; 32];
+            let mut right_bytes = [0u8; 32];
+            let mut key_bytes = [0u8; 32];
+            for (i, w) in left.iter().enumerate() {
+                left_bytes[i * 4..(i + 1) * 4].copy_from_slice(&w.to_le_bytes());
+            }
+            for (i, w) in right.iter().enumerate() {
+                right_bytes[i * 4..(i + 1) * 4].copy_from_slice(&w.to_le_bytes());
+            }
+            for (i, w) in key.iter().enumerate() {
+                key_bytes[i * 4..(i + 1) * 4].copy_from_slice(&w.to_le_bytes());
+            }
+
+            // Concatenate left || right as 64-byte input
+            let mut input = [0u8; 64];
+            input[..32].copy_from_slice(&left_bytes);
+            input[32..].copy_from_slice(&right_bytes);
+
+            // Compute expected using official blake3::keyed_hash
+            let expected = blake3::keyed_hash(&key_bytes, &input);
+
+            assert_eq!(
+                result_bytes,
+                *expected.as_bytes(),
+                "Keyed64 sequence builder does not match blake3::keyed_hash"
             );
         }
     }
