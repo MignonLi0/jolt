@@ -10,8 +10,8 @@
 use core::array;
 
 use crate::{
-    CHAINING_VALUE_LEN, COUNTER_LEN, FLAG_CHUNK_END, FLAG_CHUNK_START, FLAG_ROOT, IV,
-    MSG_BLOCK_LEN, MSG_SCHEDULE, NUM_ROUNDS,
+    CHAINING_VALUE_LEN, COUNTER_LEN, FLAG_CHUNK_END, FLAG_CHUNK_START, FLAG_KEYED_HASH, FLAG_ROOT,
+    IV, MSG_BLOCK_LEN, MSG_SCHEDULE, NUM_ROUNDS,
 };
 use tracer::instruction::format::format_inline::FormatInline;
 use tracer::instruction::ld::LD;
@@ -59,7 +59,7 @@ struct Blake3SequenceBuilder {
 #[derive(Clone, Copy)]
 enum BuildMode {
     Compression,
-    Hash64, // Hash 64B: IV fixed, flags = CHUNK_START | CHUNK_END | ROOT
+    Keyed64, // Keyed 64B hash: key from rs1, flags = CHUNK_START | CHUNK_END | ROOT | KEYED_HASH
 }
 
 impl Blake3SequenceBuilder {
@@ -74,27 +74,22 @@ impl Blake3SequenceBuilder {
     }
 
     fn build(mut self, build_mode: BuildMode) -> Vec<Instruction> {
-        // Load chaining value only for Compression mode (from memory)
-        if let BuildMode::Compression = build_mode {
-            self.load_chaining_value();
-        }
-        // Hash64 uses hardcoded IV values
-
-        // Load message
         match build_mode {
-            BuildMode::Hash64 => {
-                // Split pointers: rs1 = left 32B, rs2 = right 32B
-                self.load_message_blocks_split();
+            BuildMode::Compression => {
+                // Load chaining value (key) from rs1
+                self.load_chaining_value();
+                // Load message from rs2
+                self.load_message_blocks();
+                // Load counter, block_len, flags
+                self.load_counter();
+                self.load_input_len_and_flags();
             }
-            _ => {
-                // Compression: rs2 = message (80B)
+            BuildMode::Keyed64 => {
+                // Load chaining value (key) from rs1
+                self.load_chaining_value();
+                // Load message from rs2
                 self.load_message_blocks();
             }
-        }
-
-        if let BuildMode::Compression = build_mode {
-            self.load_counter();
-            self.load_input_len_and_flags();
         }
 
         self.initialize_internal_state(build_mode);
@@ -104,43 +99,24 @@ impl Blake3SequenceBuilder {
             self.blake3_round();
         }
 
+        // Finalize: h[i] = v[i] ^ v[i+8]
         self.finalize_state();
 
-        // Store state
-        match build_mode {
-            BuildMode::Hash64 => {
-                // Store to rd (rs3)
-                self.store_state_to_rd();
-            }
-            _ => {
-                // Store to rs1
-                self.store_state();
-            }
-        }
+        // Store state to rs1 for all modes
+        self.store_state();
 
         drop(self.vr);
         self.asm.finalize_inline()
     }
 
     fn initialize_internal_state(&mut self, build_mode: BuildMode) {
-        match build_mode {
-            BuildMode::Compression => {
-                // v[0..7] = h[0..7] (loaded from memory)
-                for i in 0..CHAINING_VALUE_LEN {
-                    self.asm.xor(
-                        Reg(*self.vr[CV_START_VR + i]),
-                        Imm(0),
-                        *self.vr[INTERNAL_STATE_VR_START + i],
-                    );
-                }
-            }
-            BuildMode::Hash64 => {
-                // v[0..7] = IV (hardcoded constants, no memory load needed)
-                for (i, val) in IV.iter().enumerate() {
-                    self.asm
-                        .emit_u::<LUI>(*self.vr[INTERNAL_STATE_VR_START + i], *val as u64);
-                }
-            }
+        // v[0..7] = chaining value (loaded from memory via rs1)
+        for i in 0..CHAINING_VALUE_LEN {
+            self.asm.xor(
+                Reg(*self.vr[CV_START_VR + i]),
+                Imm(0),
+                *self.vr[INTERNAL_STATE_VR_START + i],
+            );
         }
 
         // v[8..11] = IV[0..3]
@@ -174,8 +150,8 @@ impl Blake3SequenceBuilder {
                     *self.vr[INTERNAL_STATE_VR_START + 15],
                 );
             }
-            BuildMode::Hash64 => {
-                // Hash 64B: flags = CHUNK_START | CHUNK_END | ROOT = 0x0B
+            BuildMode::Keyed64 => {
+                // Keyed 64B: flags = CHUNK_START | CHUNK_END | ROOT | KEYED_HASH = 0x1B
                 self.asm
                     .emit_u::<LUI>(*self.vr[INTERNAL_STATE_VR_START + 12], 0);
                 self.asm
@@ -184,7 +160,7 @@ impl Blake3SequenceBuilder {
                     .emit_u::<LUI>(*self.vr[INTERNAL_STATE_VR_START + 14], 64);
                 self.asm.emit_u::<LUI>(
                     *self.vr[INTERNAL_STATE_VR_START + 15],
-                    (FLAG_CHUNK_START | FLAG_CHUNK_END | FLAG_ROOT) as u64,
+                    (FLAG_CHUNK_START | FLAG_CHUNK_END | FLAG_ROOT | FLAG_KEYED_HASH) as u64,
                 );
             }
         }
@@ -346,28 +322,6 @@ impl Blake3SequenceBuilder {
         self.load_data_range_paired(self.operands.rs2, 0, MSG_BLOCK_START_VR, MSG_BLOCK_LEN);
     }
 
-    /// Load message blocks from split pointers
-    /// rs1 = left 32B (8 u32), rs2 = right 32B (8 u32)
-    fn load_message_blocks_split(&mut self) {
-        // Load left 32B from rs1 (8 u32 = 4 pairs)
-        self.load_data_range_paired(self.operands.rs1, 0, MSG_BLOCK_START_VR, 8);
-        // Load right 32B from rs2 (8 u32 = 4 pairs)
-        self.load_data_range_paired(self.operands.rs2, 0, MSG_BLOCK_START_VR + 8, 8);
-    }
-
-    /// Store state to rd (rs3) pointer
-    fn store_state_to_rd(&mut self) {
-        // Store 8 u32 values as 4 paired u64 stores to rs3
-        for i in 0..CHAINING_VALUE_LEN / 2 {
-            self.store_paired_u32(
-                self.operands.rs3,
-                (i * 2) as i64 * 4,
-                *self.vr[CV_START_VR + i * 2],
-                *self.vr[CV_START_VR + i * 2 + 1],
-            );
-        }
-    }
-
     fn load_counter(&mut self) {
         self.load_data_range(
             self.operands.rs2,
@@ -401,17 +355,17 @@ pub fn blake3_inline_sequence_builder(
     builder.build(BuildMode::Compression)
 }
 
-/// Build sequence for Hash64 (64B input with fixed IV):
-/// - IV is hardcoded (no memory load)
-/// - flags = CHUNK_START | CHUNK_END | ROOT (0x0B)
-/// - rs1 = output pointer (32B)
-/// - rs2 = input pointer (64B)
-pub fn blake3_hash64_inline_sequence_builder(
+/// Build sequence for Keyed64 (64B keyed hash):
+/// - Key/IV loaded from rs1 (32B)
+/// - Message loaded from rs2 (64B)
+/// - flags = CHUNK_START | CHUNK_END | ROOT | KEYED_HASH (0x1B)
+/// - Output overwrites rs1
+pub fn blake3_keyed64_inline_sequence_builder(
     asm: InstrAssembler,
     operands: FormatInline,
 ) -> Vec<Instruction> {
     let builder = Blake3SequenceBuilder::new(asm, operands);
-    builder.build(BuildMode::Hash64)
+    builder.build(BuildMode::Keyed64)
 }
 
 #[cfg(test)]

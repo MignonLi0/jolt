@@ -4,10 +4,10 @@
 pub const INLINE_OPCODE: u32 = 0x0B;
 
 pub const BLAKE3_FUNCT3: u32 = 0x00;
-pub const BLAKE3_HASH64_FUNCT3: u32 = 0x02; // Hash 64B with fixed IV (CHUNK_START | CHUNK_END | ROOT)
+pub const BLAKE3_KEYED64_FUNCT3: u32 = 0x02; // Keyed 64B hash (CHUNK_START | CHUNK_END | ROOT | KEYED_HASH)
 pub const BLAKE3_FUNCT7: u32 = 0x03;
 pub const BLAKE3_NAME: &str = "BLAKE3_INLINE";
-pub const BLAKE3_HASH64_NAME: &str = "BLAKE3_HASH64_INLINE";
+pub const BLAKE3_KEYED64_NAME: &str = "BLAKE3_KEYED64_INLINE";
 
 pub mod sdk;
 pub use sdk::*;

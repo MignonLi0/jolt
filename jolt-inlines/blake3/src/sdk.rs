@@ -334,62 +334,67 @@ pub unsafe fn blake3_compress(chaining_value: *mut u32, message: *const u32) {
     );
 }
 
-/// BLAKE3 Hash64 - guest implementation.
-/// Hashes exactly 64 bytes with fixed IV and flags = CHUNK_START | CHUNK_END | ROOT.
-///
-/// # Safety
-/// - `left` must be a valid pointer to 32 bytes (first half).
-/// - `right` must be a valid pointer to 32 bytes (second half).
-/// - `output` must be a valid pointer to 32 bytes.
-/// - All pointers must be 8-byte aligned.
+/// BLAKE3 Keyed64 - guest implementation (internal).
 #[cfg(not(feature = "host"))]
-pub unsafe fn blake3_hash64_compress(left: *const u8, right: *const u8, output: *mut u8) {
-    use crate::{BLAKE3_FUNCT7, BLAKE3_HASH64_FUNCT3, INLINE_OPCODE};
-
-    debug_assert!(left as usize % 8 == 0, "left must be 8-byte aligned");
-    debug_assert!(right as usize % 8 == 0, "right must be 8-byte aligned");
-    debug_assert!(output as usize % 8 == 0, "output must be 8-byte aligned");
+#[inline(always)]
+unsafe fn blake3_keyed64_compress(key: *mut u32, message: *const u32) {
+    use crate::{BLAKE3_FUNCT7, BLAKE3_KEYED64_FUNCT3, INLINE_OPCODE};
 
     core::arch::asm!(
-        ".insn r {opcode}, {funct3}, {funct7}, {rd}, {rs1}, {rs2}",
+        ".insn r {opcode}, {funct3}, {funct7}, x0, {rs1}, {rs2}",
         opcode = const INLINE_OPCODE,
-        funct3 = const BLAKE3_HASH64_FUNCT3,
+        funct3 = const BLAKE3_KEYED64_FUNCT3,
         funct7 = const BLAKE3_FUNCT7,
-        rd = in(reg) output,
-        rs1 = in(reg) left,
-        rs2 = in(reg) right,
+        rs1 = in(reg) key,
+        rs2 = in(reg) message,
         options(nostack)
     );
 }
 
-/// BLAKE3 Hash64 - host implementation.
+/// BLAKE3 Keyed64 - host implementation (internal).
 #[cfg(feature = "host")]
-pub unsafe fn blake3_hash64_compress(left: *const u8, right: *const u8, output: *mut u8) {
-    debug_assert!(left as usize % 8 == 0, "left must be 8-byte aligned");
-    debug_assert!(right as usize % 8 == 0, "right must be 8-byte aligned");
-    debug_assert!(output as usize % 8 == 0, "output must be 8-byte aligned");
-
-    let mut message_block = [0u32; 16];
-    core::ptr::copy_nonoverlapping(left as *const u32, message_block.as_mut_ptr(), 8);
-    core::ptr::copy_nonoverlapping(right as *const u32, message_block.as_mut_ptr().add(8), 8);
-
-    let output_arr = &mut *(output as *mut [u32; 8]);
-    *output_arr = crate::IV;
+#[inline(always)]
+unsafe fn blake3_keyed64_compress(key: *mut u32, message: *const u32) {
+    let message_block = &*(message as *const [u32; 16]);
+    let key_arr = &mut *(key as *mut [u32; 8]);
 
     crate::exec::execute_blake3_compression(
-        output_arr,
-        &message_block,
+        key_arr,
+        message_block,
         &[0, 0],
         64,
-        crate::FLAG_CHUNK_START | crate::FLAG_CHUNK_END | crate::FLAG_ROOT,
+        crate::FLAG_CHUNK_START | crate::FLAG_CHUNK_END | crate::FLAG_ROOT | crate::FLAG_KEYED_HASH,
     );
+}
+
+/// BLAKE3 keyed hash for exactly 64 bytes input (in-place, zero-copy).
+///
+/// This is the most efficient high-level API. The key is modified in-place
+/// to contain the hash output.
+///
+/// # Arguments
+/// * `key` - 32-byte key (8-byte aligned), will be overwritten with hash output
+/// * `input` - Exactly 64 bytes of input data (8-byte aligned)
+///
+/// # Example
+/// ```ignore
+/// let mut key = [0u8; 32];
+/// let input = [0u8; 64];
+/// blake3_keyed64(&mut key, &input);
+/// // key now contains the 32-byte hash
+/// ```
+#[inline(always)]
+pub fn blake3_keyed64(key: &mut [u8; 32], input: &[u8; 64]) {
+    unsafe {
+        blake3_keyed64_compress(key.as_mut_ptr() as *mut u32, input.as_ptr() as *const u32);
+    }
 }
 
 #[cfg(test)]
 #[cfg(feature = "host")]
 mod tests {
     use super::Blake3;
-    use crate::{test_utils::helpers::*, BLOCK_INPUT_SIZE_IN_BYTES, CHAINING_VALUE_LEN};
+    use crate::{test_utils::helpers::*, BLOCK_INPUT_SIZE_IN_BYTES};
 
     fn random_partition(data: &[u8]) -> Vec<&[u8]> {
         use rand::rngs::StdRng;
@@ -519,51 +524,56 @@ mod tests {
     }
 
     #[test]
-    fn test_hash64_compress_consistency() {
-        // Test that hash64_compress produces consistent results
-        let left = [1u8; 32];
-        let right = [2u8; 32];
+    fn test_blake3_keyed64_api() {
+        // Test the high-level blake3_keyed64 API (in-place)
+        use rand::rngs::StdRng;
+        use rand::{RngCore, SeedableRng};
 
-        let mut output1 = [0u8; 32];
-        let mut output2 = [0u8; 32];
+        let mut rng = StdRng::seed_from_u64(99999);
 
-        unsafe {
-            super::blake3_hash64_compress(left.as_ptr(), right.as_ptr(), output1.as_mut_ptr());
-            super::blake3_hash64_compress(left.as_ptr(), right.as_ptr(), output2.as_mut_ptr());
+        for _ in 0..100 {
+            let mut key = [0u8; 32];
+            let mut input = [0u8; 64];
+            rng.fill_bytes(&mut key);
+            rng.fill_bytes(&mut input);
+
+            // Compare with standard blake3::keyed_hash (before modifying key)
+            let expected = blake3::keyed_hash(&key, &input);
+            let expected_bytes: [u8; 32] = expected.as_bytes()[..32].try_into().unwrap();
+
+            // Use our high-level API (modifies key in-place)
+            super::blake3_keyed64(&mut key, &input);
+
+            assert_eq!(key, expected_bytes, "blake3_keyed64 mismatch");
         }
-
-        assert_eq!(output1, output2, "hash64_compress should be deterministic");
-        assert_ne!(
-            output1, [0u8; 32],
-            "hash64_compress should produce non-zero output"
-        );
     }
 
     #[test]
-    fn test_hash64_matches_digest() {
-        // hash64_compress with flags = CHUNK_START | CHUNK_END | ROOT should match digest
-        let mut input = [0u8; 64];
-        for (i, b) in input.iter_mut().enumerate() {
-            *b = (i * 3 + 7) as u8;
-        }
+    fn test_blake3_keyed64_deterministic() {
+        let input = [0xABu8; 64];
 
-        let left = &input[..32];
-        let right = &input[32..];
+        let mut key1 = [0x42u8; 32];
+        let mut key2 = [0x42u8; 32];
 
-        let mut hash64_output = [0u8; 32];
-        unsafe {
-            super::blake3_hash64_compress(
-                left.as_ptr(),
-                right.as_ptr(),
-                hash64_output.as_mut_ptr(),
-            );
-        }
+        super::blake3_keyed64(&mut key1, &input);
+        super::blake3_keyed64(&mut key2, &input);
 
-        let digest_output = super::Blake3::digest(&input);
+        assert_eq!(key1, key2, "blake3_keyed64 should be deterministic");
+    }
 
-        assert_eq!(
-            hash64_output, digest_output,
-            "hash64_compress should produce same result as digest for 64B input"
+    #[test]
+    fn test_blake3_keyed64_different_keys() {
+        let input = [0xFFu8; 64];
+
+        let mut key1 = [0x11u8; 32];
+        let mut key2 = [0x22u8; 32];
+
+        super::blake3_keyed64(&mut key1, &input);
+        super::blake3_keyed64(&mut key2, &input);
+
+        assert_ne!(
+            key1, key2,
+            "Different keys should produce different results"
         );
     }
 }
